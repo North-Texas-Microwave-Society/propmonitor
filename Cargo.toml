@@ -1,0 +1,13 @@
+[package]
+name = "propmonitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+num-complex = "0.4"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+soapysdr = "0.4"
+chrono = "0.4"

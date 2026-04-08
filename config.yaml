@@ -1,0 +1,6 @@
+# propmonitor configuration
+frequency: 101100000 # Hz
+mode: wfm # usb | lsb | am | nfm | wfm | cw
+#mode: usb                # usb | lsb | am | nfm | wfm | cw
+sample_rate: 2000000 # optional, default 2_000_000
+gain: 40 # optional, dB; omit for AGC
