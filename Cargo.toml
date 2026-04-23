@@ -1,7 +1,12 @@
+[workspace]
+members = [".", "q65"]
+resolver = "2"
+
 [package]
 name = "propmonitor"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
@@ -11,3 +16,6 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 soapysdr = "0.4"
 chrono = "0.4"
+ratatui = "0.29"
+crossterm = "0.28"
+q65 = { path = "q65" }
