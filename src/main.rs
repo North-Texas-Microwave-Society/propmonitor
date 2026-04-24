@@ -1,13 +1,67 @@
 mod config;
 mod measure;
+mod ui;
+mod worker;
 
-use anyhow::{anyhow, Context, Result};
-use num_complex::Complex32;
-use soapysdr::Direction::Rx;
-use std::time::{Duration, Instant};
+use std::io::{self, Stdout};
+use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 use crate::config::Config;
-use crate::measure::{SpectrumAnalyzer, FFT_SIZE};
+use crate::ui::{render, App};
+use crate::worker::{run_worker, WorkerEvent};
+
+/// RAII guard: enable raw mode + alternate screen on construct, restore on
+/// drop. Also installs a panic hook so a panic in either thread doesn't
+/// leave the terminal wedged.
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        // Install the panic hook BEFORE entering raw mode so a panic during
+        // enable_raw_mode is still cleaned up. The hook chains to the
+        // previous hook so the panic message still surfaces.
+        let prev_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let _ = restore_terminal();
+            prev_hook(info);
+        }));
+
+        enable_raw_mode().context("enable_raw_mode failed")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen).context("EnterAlternateScreen failed")?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend).context("Terminal::new failed")?;
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = restore_terminal();
+    }
+}
+
+fn restore_terminal() -> Result<()> {
+    disable_raw_mode().ok();
+    execute!(io::stdout(), LeaveAlternateScreen).ok();
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -15,93 +69,87 @@ fn main() -> Result<()> {
     let cfg = Config::load(config_path)
         .with_context(|| format!("failed to load config from {}", config_path))?;
 
-    println!(
-        "propmonitor: tuning {:.6} MHz, mode {:?}, sr {} Hz",
-        cfg.frequency / 1e6,
-        cfg.mode,
-        cfg.sample_rate as u64
-    );
+    // Set up the terminal. The Drop on this guard restores the terminal
+    // before main returns, even on Err or panic.
+    let mut guard = TerminalGuard::enter()?;
 
-    // Find an SDRplay device.
-    let devs = soapysdr::enumerate("driver=sdrplay")
-        .context("SoapySDR enumerate failed")?;
-    if devs.is_empty() {
-        return Err(anyhow!(
-            "no SDRplay device found — is the RSP plugged in and SoapySDRPlay installed?"
-        ));
-    }
-    let dev =
-        soapysdr::Device::new("driver=sdrplay").context("failed to open SDRplay device")?;
+    let (tx, rx) = mpsc::channel::<WorkerEvent>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_cfg = cfg.clone();
+    let worker_stop = stop.clone();
+    let worker_handle = thread::spawn(move || run_worker(worker_cfg, tx, worker_stop));
 
-    dev.set_sample_rate(Rx, 0, cfg.sample_rate)
-        .context("set_sample_rate failed")?;
-    dev.set_frequency(Rx, 0, cfg.frequency, ())
-        .context("set_frequency failed")?;
+    let mut app = App::new(cfg);
 
-    match cfg.gain {
-        Some(g) => {
-            dev.set_gain_mode(Rx, 0, false).ok();
-            dev.set_gain(Rx, 0, g).context("set_gain failed")?;
-        }
-        None => {
-            // AGC on if supported; otherwise the driver's default gain stands.
-            dev.set_gain_mode(Rx, 0, true).ok();
-        }
+    // Render at ~30 Hz so the live activity bar feels responsive even if
+    // the worker only ticks 10 times a second.
+    let tick = Duration::from_millis(33);
+    let result = run_event_loop(&mut guard.terminal, &mut app, &rx, &stop, tick);
+
+    // Tell the worker to stop and join it. The worker reports its own
+    // errors via the channel, so we don't care about its return value.
+    stop.store(true, Ordering::Relaxed);
+    let _ = worker_handle.join();
+
+    // Restore the terminal explicitly before printing any error so it
+    // lands on the user's real shell rather than the alternate screen.
+    drop(guard);
+
+    if let Some(err) = app.error {
+        eprintln!("propmonitor: {}", err);
     }
 
-    let mut stream = dev
-        .rx_stream::<Complex32>(&[0])
-        .context("failed to create rx stream")?;
-    stream.activate(None).context("stream activate failed")?;
+    result
+}
 
-    let mut analyzer = SpectrumAnalyzer::new(cfg.sample_rate);
-
-    let mtu = stream.mtu().context("stream mtu failed")?;
-    let mut scratch = vec![Complex32::new(0.0, 0.0); mtu];
-
-    // Streaming frame buffer: we accumulate samples here until we have
-    // exactly FFT_SIZE, then hand them to the analyzer and reset. The
-    // analyzer keeps running totals (psd, peak, sum, frame count) for the
-    // whole minute — we never buffer the full minute of IQ.
-    let mut frame_buf: Vec<Complex32> = Vec::with_capacity(FFT_SIZE);
-    const WINDOW: Duration = Duration::from_secs(60);
-
+fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    rx: &mpsc::Receiver<WorkerEvent>,
+    stop: &Arc<AtomicBool>,
+    tick: Duration,
+) -> Result<()> {
     loop {
-        let window_start = Instant::now();
-        analyzer.start_window(cfg.mode);
-        frame_buf.clear();
-
-        while window_start.elapsed() < WINDOW {
-            // Don't read past the end of the frame; otherwise we'd overflow
-            // frame_buf and lose samples.
-            let want = (FFT_SIZE - frame_buf.len()).min(scratch.len());
-            let n = stream
-                .read(&mut [&mut scratch[..want]], 1_000_000)
-                .context("stream read failed")?;
-            if n == 0 {
-                continue;
-            }
-            frame_buf.extend_from_slice(&scratch[..n]);
-            if frame_buf.len() == FFT_SIZE {
-                analyzer.add_frame(&frame_buf);
-                frame_buf.clear();
+        // Drain any worker events that have arrived.
+        loop {
+            match rx.try_recv() {
+                Ok(WorkerEvent::WindowStarted { at }) => app.on_window_started(at),
+                Ok(WorkerEvent::FrameTick { in_band_dbfs }) => app.on_frame_tick(in_band_dbfs),
+                Ok(WorkerEvent::WindowComplete(m)) => app.on_window_complete(m),
+                Ok(WorkerEvent::Q65Decodes(rows)) => app.on_q65_decodes(rows),
+                Ok(WorkerEvent::Error(e)) => {
+                    app.error = Some(e);
+                    app.should_quit = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.should_quit = true;
+                    break;
+                }
             }
         }
 
-        match analyzer.finalize() {
-            Some(m) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "{}  noise: {:7.2} dBFS   sig peak/avg: {:7.2} / {:7.2} dBFS   snr peak/avg: {:6.2} / {:6.2} dB",
-                    ts,
-                    m.noise_dbfs,
-                    m.signal_peak_dbfs,
-                    m.signal_avg_dbfs,
-                    m.snr_peak_db,
-                    m.snr_avg_db,
-                );
+        terminal.draw(|f| render(f, app))?;
+
+        if app.should_quit {
+            stop.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // Poll keyboard with the render-tick budget so the loop wakes up at
+        // ~30 Hz even when nothing is happening.
+        if event::poll(tick).context("event::poll failed")? {
+            if let Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) = event::read().context("event::read failed")?
+            {
+                let quit = matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+                    || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL));
+                if quit {
+                    stop.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
-            None => eprintln!("measurement failed (no frames in window)"),
         }
     }
 }

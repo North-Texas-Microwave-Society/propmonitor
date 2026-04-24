@@ -1,6 +1,6 @@
 # propmonitor
 
-A small Rust CLI for monitoring HF/VHF propagation conditions with a software-defined radio. It tunes an SDR to a configured frequency and mode, captures IQ samples, and once per minute reports the noise floor, in-band signal level (both peak and average), and SNR in dB.
+A small Rust CLI for monitoring radio propagation conditions with a software-defined radio. It tunes an SDR to a configured frequency and mode, captures IQ samples, and once per minute reports the noise floor, in-band signal level (both peak and average), and SNR in dB.
 
 It's intended for unattended, long-running captures — for example, watching a beacon, a broadcast carrier, or a band segment over hours or days to get a sense of how propagation is shifting.
 

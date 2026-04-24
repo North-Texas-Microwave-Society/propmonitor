@@ -6,6 +6,7 @@ use crate::config::Mode;
 
 pub const FFT_SIZE: usize = 16_384;
 
+#[derive(Debug, Clone, Copy)]
 pub struct Measurement {
     pub noise_dbfs: f64,
     /// Strongest single-frame in-band power across the capture window.
@@ -97,12 +98,14 @@ impl SpectrumAnalyzer {
 
     /// Process exactly one FFT_SIZE-sample frame. The signal-bin range from
     /// `start_window` is used to track per-frame in-band peak and mean.
-    pub fn add_frame(&mut self, frame: &[Complex32]) {
+    /// Returns the just-processed frame's in-band power (linear, normalized
+    /// the same way as `signal_avg_dbfs`/`signal_peak_dbfs`) so callers can
+    /// drive a live activity meter without re-running the FFT.
+    pub fn add_frame(&mut self, frame: &[Complex32]) -> f64 {
         debug_assert_eq!(frame.len(), FFT_SIZE);
         debug_assert!(self.accum_mode.is_some(), "start_window not called");
 
-        for i in 0..FFT_SIZE {
-            let s = frame[i];
+        for (i, &s) in frame.iter().enumerate() {
             let w = self.window[i];
             self.fft_buf[i] = Complex32::new(s.re * w, s.im * w);
         }
@@ -126,6 +129,7 @@ impl SpectrumAnalyzer {
         }
         self.sig_sum_power += frame_sig_power;
         self.frame_count += 1;
+        frame_sig_power
     }
 
     /// Finalize the current measurement window and return the result.
@@ -274,6 +278,47 @@ mod tests {
             (avg_delta - 3.0).abs() < 0.5,
             "half-keyed avg should be ~3 dB below full, got {} dB",
             avg_delta
+        );
+    }
+
+    /// `add_frame` returns the just-processed frame's in-band power so the
+    /// worker thread can drive a live activity meter without re-doing the
+    /// FFT. A frame containing a tone in the passband should return a much
+    /// larger value than a frame of zeros.
+    #[test]
+    fn add_frame_returns_per_frame_in_band_power() {
+        let sr = 2_000_000.0;
+        let mut analyzer = SpectrumAnalyzer::new(sr);
+        analyzer.start_window(Mode::Cw);
+
+        // Frame 1: clean 700 Hz tone (middle of CW passband)
+        let mut tone_frame = Vec::with_capacity(FFT_SIZE);
+        for i in 0..FFT_SIZE {
+            let t = i as f32 / sr as f32;
+            let phase = 2.0 * PI * 700.0 * t;
+            tone_frame.push(Complex32::new(phase.cos(), phase.sin()));
+        }
+        let tone_power = analyzer.add_frame(&tone_frame);
+
+        // Frame 2: silence
+        let zero_frame = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
+        let zero_power = analyzer.add_frame(&zero_frame);
+
+        assert!(
+            tone_power > 1e-3,
+            "tone frame should return non-trivial in-band power, got {}",
+            tone_power
+        );
+        assert!(
+            zero_power < 1e-10,
+            "zero frame should return ~0 in-band power, got {}",
+            zero_power
+        );
+        assert!(
+            tone_power > zero_power * 1e6,
+            "tone power should dwarf zero power, tone={} zero={}",
+            tone_power,
+            zero_power
         );
     }
 

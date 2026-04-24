@@ -1,6 +1,11 @@
 # propmonitor configuration
-frequency: 101100000 # Hz
-mode: wfm # usb | lsb | am | nfm | wfm | cw
-#mode: usb                # usb | lsb | am | nfm | wfm | cw
+frequency: 50211000 # Hz
+mode: q65 # usb | lsb | am | nfm | wfm | cw | q65
 sample_rate: 2000000 # optional, default 2_000_000
 gain: 40 # optional, dB; omit for AGC
+
+q65:
+  submode: "60C" # MVP only accepts 60C
+  audio_center_hz: 1500
+  audio_search_hz: 200
+  max_decodes_per_period: 5

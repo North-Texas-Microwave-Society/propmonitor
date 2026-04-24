@@ -1,0 +1,13 @@
+[package]
+name = "q65"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust Q65 (WSJT-X weak-signal mode) encoder and decoder. MVP targets Q65-60C."
+# The QRA code tables and CRC-12 polynomial in `qra.rs` are transcribed
+# from WSJT-X (GPLv3, by Nico Palermo / IV3NWV and Joe Taylor / K1JT), so
+# this crate must carry a compatible GPLv3-or-later license.
+license = "GPL-3.0-or-later"
+
+[dependencies]
+num-complex = "0.4"
+rustfft = "6"
