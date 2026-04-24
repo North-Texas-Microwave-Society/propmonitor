@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use chrono::{DateTime, Local};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -10,17 +9,18 @@ use ratatui::Frame;
 
 use crate::config::{Config, Mode};
 use crate::measure::Measurement;
+use crate::timefmt::LocalHms;
 
 /// One row in the analog-mode history table.
 pub struct HistoryRow {
-    pub at: DateTime<Local>,
+    pub at: LocalHms,
     pub measurement: Measurement,
 }
 
 /// One row in the Q65 decode list.
 #[derive(Debug, Clone)]
 pub struct Q65Row {
-    pub at: DateTime<Local>,
+    pub at: LocalHms,
     pub snr_db: f32,
     pub dt_s: f32,
     pub freq_hz: f32,
@@ -66,7 +66,7 @@ impl App {
     pub fn on_window_complete(&mut self, m: Measurement) {
         self.last_noise_dbfs = Some(m.noise_dbfs);
         self.history.push_front(HistoryRow {
-            at: Local::now(),
+            at: LocalHms::now(),
             measurement: m,
         });
         self.last = Some(m);
@@ -223,7 +223,7 @@ fn render_history(f: &mut Frame, area: Rect, app: &App) {
         .map(|h| {
             let m = &h.measurement;
             Row::new(vec![
-                Cell::from(h.at.format("%H:%M:%S").to_string()),
+                Cell::from(h.at.format_hms()),
                 Cell::from(format!("{:>7.2}", m.noise_dbfs)),
                 Cell::from(format!("{:>7.2}", m.signal_peak_dbfs)),
                 Cell::from(format!("{:>7.2}", m.signal_avg_dbfs)),
@@ -315,7 +315,7 @@ fn render_q65_list(f: &mut Frame, area: Rect, app: &App) {
         .take(visible)
         .map(|r| {
             Row::new(vec![
-                Cell::from(r.at.format("%H:%M:%S").to_string()),
+                Cell::from(r.at.format_hms()),
                 Cell::from(format!("{:>4.0}", r.snr_db)),
                 Cell::from(format!("{:>5.1}", r.dt_s)),
                 Cell::from(format!("{:>5.0}", r.freq_hz)),

@@ -4,12 +4,13 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
 use num_complex::Complex32;
 use soapysdr::Direction::Rx;
 
 use crate::config::{Config, Mode};
+use crate::error::{Context, Error, Result};
 use crate::measure::{Measurement, SpectrumAnalyzer, FFT_SIZE};
+use crate::timefmt::{utc_seconds_into_minute, LocalHms};
 use crate::ui::Q65Row;
 
 // Minimal FFI so we can swap SoapySDR's default stderr log handler for a
@@ -53,7 +54,7 @@ pub enum WorkerEvent {
 /// terminal — this function never returns an error directly.
 pub fn run_worker(cfg: Config, tx: Sender<WorkerEvent>, stop: Arc<AtomicBool>) {
     if let Err(e) = run_inner(&cfg, &tx, &stop) {
-        let _ = tx.send(WorkerEvent::Error(format!("{:#}", e)));
+        let _ = tx.send(WorkerEvent::Error(format!("{}", e)));
     }
 }
 
@@ -66,8 +67,8 @@ fn run_inner(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> 
 
     let devs = soapysdr::enumerate("driver=sdrplay").context("SoapySDR enumerate failed")?;
     if devs.is_empty() {
-        return Err(anyhow!(
-            "no SDRplay device found — is the RSP plugged in and SoapySDRPlay installed?"
+        return Err(Error::msg(
+            "no SDRplay device found — is the RSP plugged in and SoapySDRPlay installed?",
         ));
     }
     let dev =
@@ -121,7 +122,7 @@ fn run_inner(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> 
             let n = match stream.read(&mut [&mut scratch[..want]], 100_000) {
                 Ok(n) => n,
                 Err(e) if e.code == soapysdr::ErrorCode::Timeout => continue,
-                Err(e) => return Err(anyhow!("stream read failed: {}", e)),
+                Err(e) => return Err(Error::msg(format!("stream read failed: {}", e))),
             };
             if n == 0 {
                 continue;
@@ -164,17 +165,15 @@ fn run_inner(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> 
 // IMPLEMENTATION_PLAN.md for the remaining work.
 
 fn run_q65(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> Result<()> {
-    use chrono::{Timelike, Utc};
-
     let q = cfg
         .q65
         .as_ref()
-        .ok_or_else(|| anyhow!("mode q65 but no q65: config block present"))?;
+        .ok_or_else(|| Error::msg("mode q65 but no q65: config block present"))?;
 
     let devs = soapysdr::enumerate("driver=sdrplay").context("SoapySDR enumerate failed")?;
     if devs.is_empty() {
-        return Err(anyhow!(
-            "no SDRplay device found — is the RSP plugged in and SoapySDRPlay installed?"
+        return Err(Error::msg(
+            "no SDRplay device found — is the RSP plugged in and SoapySDRPlay installed?",
         ));
     }
     let dev =
@@ -227,8 +226,7 @@ fn run_q65(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> Re
 
     // Align first period to the next UTC minute boundary. Seconds-since-minute
     // > 0 means we skip the current partial period.
-    let now = Utc::now();
-    let secs_past = now.second() as f64 + now.timestamp_subsec_nanos() as f64 * 1e-9;
+    let secs_past = utc_seconds_into_minute();
     let mut next_period_start_wall = Instant::now()
         + Duration::from_secs_f64((60.0 - secs_past).max(0.1));
     // Drop incoming samples until we cross into the next period.
@@ -252,7 +250,7 @@ fn run_q65(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> Re
         let n = match stream.read(&mut [&mut scratch[..]], 100_000) {
             Ok(n) => n,
             Err(e) if e.code == soapysdr::ErrorCode::Timeout => continue,
-            Err(e) => return Err(anyhow!("stream read failed: {}", e)),
+            Err(e) => return Err(Error::msg(format!("stream read failed: {}", e))),
         };
 
         if buffering && n > 0 {
@@ -309,7 +307,7 @@ fn decode_q65_period(
         freq_step_hz: 2.0,
         max_decodes: q.max_decodes_per_period,
     };
-    let now = chrono::Local::now();
+    let now = LocalHms::now();
     match q65::decode(&q65::Q65_60C, audio, audio_sr, &search) {
         Ok(decs) => decs
             .into_iter()

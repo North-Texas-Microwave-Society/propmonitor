@@ -1,7 +1,10 @@
 mod config;
+mod error;
 mod measure;
+mod timefmt;
 mod ui;
 mod worker;
+mod yaml;
 
 use std::io::{self, Stdout};
 use std::panic;
@@ -11,7 +14,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,6 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::config::Config;
+use crate::error::{Context, Result};
 use crate::ui::{render, App};
 use crate::worker::{run_worker, WorkerEvent};
 
