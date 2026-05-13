@@ -1,7 +1,3 @@
-[workspace]
-members = [".", "q65"]
-resolver = "2"
-
 [package]
 name = "propmonitor"
 version = "0.1.0"
@@ -12,6 +8,19 @@ license = "GPL-3.0-or-later"
 num-complex = "0.4"
 rustfft = "6"
 soapysdr = "0.4"
-ratatui = "0.29"
-crossterm = "0.28"
-q65 = { path = "q65" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+axum = { version = "0.7", features = ["ws"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.19"
+tao = "0.30"
+webbrowser = "1"
+
+[[bin]]
+name = "propmonitor"
+path = "src/main.rs"
+
+[[bin]]
+name = "sdr_diag"
+path = "src/bin/sdr_diag.rs"

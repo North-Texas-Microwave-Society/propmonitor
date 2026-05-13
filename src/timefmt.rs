@@ -1,71 +1,47 @@
-//! Tiny `chrono` replacement: just enough to format a `SystemTime` as
-//! `HH:MM:SS` in local time and to read the current sub-minute fractional
-//! second for UTC alignment. Uses libc's `localtime_r` directly so we
-//! don't pull in a calendar crate for a single date format.
+//! Tiny date helpers. The headless server only ever needs UTC ISO-8601
+//! timestamps, so we compute them manually from Unix seconds rather than
+//! pulling in `chrono` for one format.
+//!
+//! Hand-rolled instead of using libc's `gmtime_r` because that symbol is
+//! POSIX-only — Windows MSVC ships `gmtime_s` with a different signature.
+//! The math here is ~30 lines and runs identically on every platform.
 
-use std::os::raw::{c_char, c_int, c_long};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[repr(C)]
-struct Tm {
-    tm_sec: c_int,
-    tm_min: c_int,
-    tm_hour: c_int,
-    tm_mday: c_int,
-    tm_mon: c_int,
-    tm_year: c_int,
-    tm_wday: c_int,
-    tm_yday: c_int,
-    tm_isdst: c_int,
-    tm_gmtoff: c_long,
-    tm_zone: *const c_char,
+/// Format Unix seconds as a UTC ISO-8601 string: `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// Valid for any non-negative `unix_secs`. Negative inputs (pre-1970) are
+/// clamped to the epoch — we never report dates before 1970.
+pub fn format_utc_iso8601(unix_secs: i64) -> String {
+    let secs = unix_secs.max(0) as u64;
+    let (year, month, day) = days_to_ymd((secs / 86_400) as u32);
+    let sod = (secs % 86_400) as u32;
+    let hour = sod / 3_600;
+    let min = (sod % 3_600) / 60;
+    let sec = sod % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, min, sec
+    )
 }
 
-extern "C" {
-    fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
-}
-
-/// Local wall-clock time captured at construction. We only ever need
-/// HH:MM:SS for the UI table, so we store nothing fancier.
-#[derive(Debug, Clone, Copy)]
-pub struct LocalHms {
-    pub h: u8,
-    pub m: u8,
-    pub s: u8,
-}
-
-impl LocalHms {
-    pub fn now() -> Self {
-        Self::from_unix(unix_now_secs())
-    }
-
-    pub fn from_unix(secs: i64) -> Self {
-        // SAFETY: localtime_r writes into a stack-owned Tm. The pointer
-        // we pass is non-null and well-aligned, and we only read the
-        // integer fields that POSIX guarantees are populated.
-        unsafe {
-            let mut tm: Tm = std::mem::zeroed();
-            let res = localtime_r(&secs as *const i64, &mut tm as *mut Tm);
-            if res.is_null() {
-                // localtime_r failure on a valid time_t is essentially
-                // impossible on the platforms we run on. Fall back to
-                // UTC HH:MM:SS so we never panic in the UI thread.
-                let s = secs.rem_euclid(60) as u8;
-                let m = (secs.rem_euclid(3600) / 60) as u8;
-                let h = (secs.rem_euclid(86400) / 3600) as u8;
-                return LocalHms { h, m, s };
-            }
-            LocalHms {
-                h: tm.tm_hour as u8,
-                m: tm.tm_min as u8,
-                s: tm.tm_sec as u8,
-            }
-        }
-    }
-
-    pub fn format_hms(&self) -> String {
-        format!("{:02}:{:02}:{:02}", self.h, self.m, self.s)
-    }
+/// Convert "days since 1970-01-01" to (year, month, day). Handles Gregorian
+/// leap years correctly. Algorithm: Howard Hinnant's date-from-days, the
+/// one used by C++20 <chrono>.
+fn days_to_ymd(days_since_epoch: u32) -> (i32, u32, u32) {
+    // Shift to the proleptic Gregorian calendar where year 0 = March-based.
+    // Reference: https://howardhinnant.github.io/date_algorithms.html#civil_from_days
+    let z = days_since_epoch as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as i32, m as u32, d as u32)
 }
 
 /// UTC seconds since the Unix epoch.
@@ -76,40 +52,41 @@ pub fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Returns (seconds, subsec_fraction) modulo 60 in UTC. Used by the Q65
-/// worker to align the first capture period to the next UTC minute.
-pub fn utc_seconds_into_minute() -> f64 {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = (d.as_secs() % 60) as f64;
-    let frac = d.subsec_nanos() as f64 * 1e-9;
-    secs + frac
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn formats_zero_padded_hms() {
-        let t = LocalHms { h: 3, m: 4, s: 9 };
-        assert_eq!(t.format_hms(), "03:04:09");
+    fn formats_epoch_as_iso8601() {
+        assert_eq!(format_utc_iso8601(0), "1970-01-01T00:00:00Z");
     }
 
     #[test]
-    fn from_unix_handles_known_epoch() {
-        // 1970-01-01 00:00:00 UTC. Local time will vary by TZ, but we can
-        // at least confirm it produces a sane HMS without crashing.
-        let t = LocalHms::from_unix(0);
-        assert!(t.h < 24);
-        assert!(t.m < 60);
-        assert!(t.s < 60);
+    fn formats_a_known_recent_timestamp() {
+        // 2026-05-13T15:10:00Z = 1_778_685_000
+        assert_eq!(format_utc_iso8601(1_778_685_000), "2026-05-13T15:10:00Z");
     }
 
     #[test]
-    fn utc_seconds_into_minute_in_range() {
-        let f = utc_seconds_into_minute();
-        assert!((0.0..60.0).contains(&f));
+    fn handles_leap_day_2024() {
+        // 2024-02-29T00:00:00Z = 1_709_164_800
+        assert_eq!(format_utc_iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn handles_year_2000_century_leap() {
+        // 2000-02-29T00:00:00Z = 951_782_400 (2000 is a leap year despite %100)
+        assert_eq!(format_utc_iso8601(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn handles_year_2100_non_leap() {
+        // 2100-03-01T00:00:00Z = 4_107_542_400 (2100 is NOT a leap year)
+        assert_eq!(format_utc_iso8601(4_107_542_400), "2100-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn negative_input_clamps_to_epoch() {
+        assert_eq!(format_utc_iso8601(-1), "1970-01-01T00:00:00Z");
     }
 }

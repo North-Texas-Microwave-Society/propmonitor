@@ -1,44 +1,111 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repo.
 
 ## What this is
 
-`propmonitor` is a Rust CLI that captures IQ samples from an SDRplay RSP1A over SoapySDR, runs a streaming FFT-based spectrum analyzer on them, and once per minute prints noise floor, in-band signal level (peak and average), and SNR for a configured frequency and radio mode. Only validated on macOS with an RSP1A.
+`propmonitor` is a headless Rust daemon that captures IQ from a SoapySDR
+device, measures noise/signal/SNR over a configurable integration
+window, exposes a live web UI + REST/WebSocket API on the LAN, and
+periodically uploads measurements to **microwaveprop** so beacon
+strength can be correlated with weather over time. The point is
+24/7 beacon monitoring, not interactive use.
+
+The binary opens a system-tray icon on startup and auto-launches the
+operator's browser at `http://127.0.0.1:8080`. The tray's only
+interactions are **Open in browser** and **Quit**.
 
 ## Commands
 
 ```bash
-cargo build                       # debug build
-cargo build --release             # release build (use this for real captures)
-cargo run                         # runs with ./config.yaml
-cargo run -- path/to/config.yaml  # runs with an explicit config
-cargo test                        # runs all unit tests
-cargo test tone_in_passband_has_high_snr   # run a single test by name
+cargo build --release
+./target/release/propmonitor                  # uses ./config.yaml
+./target/release/propmonitor path/to.yaml
+cargo test
+cargo test tone_in_passband_has_high_snr      # single test
 cargo clippy
 cargo fmt
 ```
 
-Runtime dependencies (not installed by cargo): `SoapySDR` and the `SoapySDRPlay` driver must be present for the binary to find an SDRplay device. If `soapysdr::enumerate("driver=sdrplay")` returns empty, that's the cause.
+Runtime dependency: a working `SoapySDR` install plus the driver module
+for the dongle being used. On Linux, `libayatana-appindicator3` is also
+needed at runtime for the tray icon (the binary falls back to headless
+mode if it can't init the tray — the server still works).
 
 ## Architecture
 
-Three files, one binary. The interesting split is between *streaming* and *windowed* processing:
+One process owns the SDR (single-instance). Inside the process:
 
-- **`src/main.rs`** — owns the SDR device and the outer one-minute capture loop. Does **not** buffer a full minute of IQ. Instead it reads from the SoapySDR stream into a small `scratch` buffer, appends into `frame_buf` until it holds exactly `FFT_SIZE` (16384) samples, hands that one frame to the analyzer, and clears it. At the end of each 60-second window it calls `finalize()` and prints the `Measurement`.
+- **`src/main.rs`** — Boots the tokio runtime on a **worker thread**,
+  not the main thread. The OS tray event loop must own the main thread
+  on Windows and macOS, so tokio is `Box::leak`'d behind that.
+- **`src/tray.rs`** — Builds a tao `EventLoop` and a tray-icon with
+  hand-rendered 32×32 antenna RGBA (no PNG decoder dep). Falls back to
+  `thread::park()` if the OS doesn't support the tray (e.g. headless
+  Linux over SSH).
+- **`src/worker.rs`** — Owns the SDR device. Sync `std::thread`, not
+  async — SoapySDR is sync and blocking reads are simplest. Emits
+  `WorkerEvent`s (`PeriodStarted`, `PeriodMeasurement`, `WaterfallRow`,
+  `RawLevel`, `DeviceInfo`, `Error`) over an mpsc channel.
+- **`src/server.rs`** — axum HTTP/WS server + a sync→async bridge
+  thread. The bridge reads `WorkerEvent`s from the mpsc, converts each
+  to a `WsEvent`, updates derived state (`device_info`, `last_raw_dbfs`,
+  `MeasurementStore`), and broadcasts on a `tokio::sync::broadcast` that
+  WS clients and the uploader subscribe to.
+- **`src/uploader.rs`** — Long-running tokio task. Subscribes to the
+  broadcast, builds a JSON payload from each `Measurement` + the current
+  config (callsign, frequency, passband), POSTs to microwaveprop with
+  Bearer auth. Failures go into a bounded retry queue (cap 1440 = 24 h)
+  with exponential backoff (1 s → 5 min).
+- **`src/measure.rs`** — `SpectrumAnalyzer`: Hann-windowed FFT,
+  fftshift on the fly, in-band peak + average tracking, median-of-out-
+  of-passband noise floor with a guard region. `start_window(offset_hz,
+  width_hz)` → `add_frame(…)` → `finalize()`. Mode-agnostic.
+- **`src/config.rs`** — `Mode` enum + per-mode `passband_for(mode,
+  beacon)`. `Mode::Beacon` reads its passband from `beacon: { offset_hz,
+  bandwidth_hz }` so the operator can dial in a narrow window for a
+  specific beacon carrier.
+- **`src/store.rs`** — 24 h in-memory ring buffer (1440 cap) of recent
+  `Measurement`s. Drives `/api/measurements`. Not persisted — restarts
+  reset history.
+- **`src/yaml.rs`** — Minimal in-tree YAML parser AND writer for the
+  small set of fields the config uses. No serde/yaml dep.
+- **`src/timefmt.rs`** — Portable Unix-seconds → ISO-8601 UTC
+  formatting via Howard Hinnant's `civil_from_days` algorithm. No
+  `gmtime_r` so it works on Windows MSVC.
+- **`src/web/`** — Embedded HTML/CSS/JS (single page, no build step).
+  Canvas waterfall, settings form bound to `/api/config`, live dBFS +
+  measurement readouts, upload-status line.
+- **`src/bin/sdr_diag.rs`** — Standalone diagnostic CLI. Useful when
+  the waterfall in the web UI looks wrong and you want to rule out the
+  DSP/server path.
 
-- **`src/measure.rs`** — `SpectrumAnalyzer` is a streaming accumulator, not a batch processor. The lifecycle is:
-  1. `start_window(mode)` — zeros the PSD sum, resets peak/avg signal power and frame count, and pre-computes the in-band bin range (`sig_lo`..`sig_hi`) for the mode's passband.
-  2. `add_frame(&[Complex32])` — applies a Hann window, does one FFT, does `fftshift` on the fly while accumulating into `psd_sum`, and updates the per-frame in-band peak and running sum.
-  3. `finalize()` — time-averages `psd_sum`, estimates the noise floor as the **median of out-of-passband bins** (with a guard region of `half_width_bins` on each side of the passband to keep spectral leakage from a strong in-band signal out of the noise estimate), and returns a `Measurement`.
+`Measurement` reports **both** `signal_peak_dbfs` and `signal_avg_dbfs`
+on purpose: peak is for keyed/bursty signals (CW beacons), avg is for
+continuous carriers (FM/AM). Tests in `measure.rs` pin that contract.
 
-  `Measurement` reports **both** `signal_peak_dbfs` and `signal_avg_dbfs` on purpose: peak is for keyed/bursty signals (CW, SSB voice) where averaging across silent frames understates the carrier; avg is for continuous carriers (FM/AM broadcast) and captures duty cycle. The tests in this file pin that contract — `keyed_cw_signal_is_gated_to_active_frames` specifically asserts that a half-keyed CW signal has the same peak as always-on but ~3 dB lower average. Don't "fix" that by collapsing the two fields.
+## Persistent vs ephemeral
 
-- **`src/config.rs`** — YAML-backed config plus the `Mode` enum. `Mode::passband()` is the single source of truth for per-mode `(offset_hz, bandwidth_hz)`; changing those numbers changes both the signal-bin range used during accumulation and the guard region used during noise estimation.
+- **Persistent:** `config.yaml`. Written atomically by `PUT /api/config`
+  (tmp + fsync + rename).
+- **Ephemeral:** measurement history, retry queue, raw dBFS, device
+  info. All in-memory. Restarts reset them.
 
-## Things to know before editing
+## When editing
 
-- `FFT_SIZE` is a `pub const` in `measure.rs` and is baked into buffer sizes in `main.rs`. If you change it, the frame-buffer fill loop in `main.rs` still works, but expect the noise/signal numbers to shift slightly (bin width changes, so passband rounding changes).
-- `start_window` / `add_frame` / `finalize` is an ordered protocol. `add_frame` has a `debug_assert!` that `start_window` was called. `finalize` clears `accum_mode` so a window can't be silently reused.
-- The `analyze()` batch helper in `measure.rs` is `#[cfg(test)]` only — it exists so tests can feed a whole buffer at once. Production code goes through the streaming path in `main.rs`.
-- Gain handling: if `config.gain` is `Some`, AGC is explicitly disabled and the gain is set; if `None`, AGC is enabled (best-effort — the `.ok()` swallows unsupported-driver errors intentionally).
+- `FFT_SIZE` in `measure.rs` (16 384) is baked into buffer logic in
+  `worker.rs`. Changing it shifts the noise/signal numbers slightly
+  because bin width changes.
+- `start_window` / `add_frame` / `finalize` is an ordered protocol.
+  `add_frame` has a `debug_assert!` that `start_window` was called.
+- The `analyze()` batch helper in `measure.rs` is `#[cfg(test)]` only.
+  Production goes through the streaming path in `worker.rs`.
+- Gain handling: if `cfg.gain` is `Some`, AGC is explicitly disabled and
+  the gain is set. RTL-SDR's `TUNER` element gets the value; other
+  drivers fall back to `set_gain`. If `cfg.gain` is `None`, AGC is on.
+- The HTTP `bind` field can be `0.0.0.0:port` for LAN access, but the
+  browser auto-opens to `127.0.0.1:port` — `browser_url_from_bind` in
+  `main.rs` does this substitution.
+- The microwaveprop ingest endpoint **doesn't yet exist on the server
+  side** — see `api.md` §4 for the wire contract this client targets.
+- Windows builds aren't in CI. See `windows_build.md`.

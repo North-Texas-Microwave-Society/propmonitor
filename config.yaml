@@ -1,11 +1,20 @@
 # propmonitor configuration
-frequency: 50211000 # Hz
-mode: q65 # usb | lsb | am | nfm | wfm | cw | q65
-sample_rate: 2000000 # optional, default 2_000_000
-gain: 40 # optional, dB; omit for AGC
+frequency: 28330000 # Hz — 10 m beacon band
+mode: beacon # usb | lsb | am | nfm | wfm | cw | beacon
+driver: "rtlsdr,serial=03340219" # Nooelec NESDR SMArt v5
+sample_rate: 250000 # narrow rate gives waterfall ~244 Hz/bin
+gain: 10 # low — TX is inches away, avoid front-end compression
+ppm: 0
+period_seconds: 60
 
-q65:
-  submode: "60C" # MVP only accepts 60C
-  audio_center_hz: 1500
-  audio_search_hz: 200
-  max_decodes_per_period: 5
+beacon:
+  offset_hz: 0
+  bandwidth_hz: 50
+
+http:
+  bind: "0.0.0.0:5760"
+
+# microwaveprop:
+#   enabled: true
+#   monitor_token: "your-monitor-token-here"
+#   beacon_callsign: "W1XYZ"

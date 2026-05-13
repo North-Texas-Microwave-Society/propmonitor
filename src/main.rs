@@ -1,158 +1,154 @@
 mod config;
 mod error;
 mod measure;
+mod server;
+mod store;
 mod timefmt;
-mod ui;
+mod tray;
+mod uploader;
 mod worker;
 mod yaml;
 
-use std::io::{self, Stdout};
-use std::panic;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
-use crate::error::{Context, Result};
-use crate::ui::{render, App};
-use crate::worker::{run_worker, WorkerEvent};
-
-/// RAII guard: enable raw mode + alternate screen on construct, restore on
-/// drop. Also installs a panic hook so a panic in either thread doesn't
-/// leave the terminal wedged.
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        // Install the panic hook BEFORE entering raw mode so a panic during
-        // enable_raw_mode is still cleaned up. The hook chains to the
-        // previous hook so the panic message still surfaces.
-        let prev_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            let _ = restore_terminal();
-            prev_hook(info);
-        }));
-
-        enable_raw_mode().context("enable_raw_mode failed")?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("EnterAlternateScreen failed")?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).context("Terminal::new failed")?;
-        Ok(Self { terminal })
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = restore_terminal();
-    }
-}
-
-fn restore_terminal() -> Result<()> {
-    disable_raw_mode().ok();
-    execute!(io::stdout(), LeaveAlternateScreen).ok();
-    Ok(())
-}
+use crate::error::{Context, Error, Result};
+use crate::server::{
+    forward_upload_events, new_broadcaster, spawn_worker_and_bridge, AppState,
+};
+use crate::store::MeasurementStore;
+use crate::uploader::{new_event_channel, UploaderStatus};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let config_path = args.get(1).map(String::as_str).unwrap_or("config.yaml");
-    let cfg = Config::load(config_path)
+    let config_path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "config.yaml".to_string());
+    let cfg = Config::load(&config_path)
         .with_context(|| format!("failed to load config from {}", config_path))?;
+    let bind = cfg.http.bind.clone();
+    let browser_url = browser_url_from_bind(&bind);
 
-    // Set up the terminal. The Drop on this guard restores the terminal
-    // before main returns, even on Err or panic.
-    let mut guard = TerminalGuard::enter()?;
+    // Tokio runs on a worker thread because the OS tray on Windows and
+    // macOS *requires* the event loop on the process's main thread. The
+    // server, worker thread, bridge, and uploader all live inside this
+    // runtime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::msg(format!("tokio runtime: {}", e)))?;
 
-    let (tx, rx) = mpsc::channel::<WorkerEvent>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_cfg = cfg.clone();
-    let worker_stop = stop.clone();
-    let worker_handle = thread::spawn(move || run_worker(worker_cfg, tx, worker_stop));
+    // Set up state and spawn background tasks while we still have the
+    // runtime handle directly available.
+    let state = rt.block_on(async { boot(cfg, config_path).await })?;
 
-    let mut app = App::new(cfg);
-
-    // Render at ~30 Hz so the live activity bar feels responsive even if
-    // the worker only ticks 10 times a second.
-    let tick = Duration::from_millis(33);
-    let result = run_event_loop(&mut guard.terminal, &mut app, &rx, &stop, tick);
-
-    // Tell the worker to stop and join it. The worker reports its own
-    // errors via the channel, so we don't care about its return value.
-    stop.store(true, Ordering::Relaxed);
-    let _ = worker_handle.join();
-
-    // Restore the terminal explicitly before printing any error so it
-    // lands on the user's real shell rather than the alternate screen.
-    drop(guard);
-
-    if let Some(err) = app.error {
-        eprintln!("propmonitor: {}", err);
+    {
+        let state = state.clone();
+        let bind = bind.clone();
+        rt.spawn(async move {
+            if let Err(e) = server::run(state, &bind).await {
+                eprintln!("propmonitor: server exited: {}", e);
+                std::process::exit(1);
+            }
+        });
     }
 
-    result
+    // Auto-open browser shortly after the server starts. A short delay
+    // is enough for axum to be listening on the port.
+    //
+    // Suppressed by `PROPMONITOR_NO_BROWSER=1` for headless deployments
+    // and for any future integration tests that boot the server without
+    // wanting to pop a real window. (Today's `cargo test` doesn't invoke
+    // `main`, so this gate is belt-and-braces.)
+    if std::env::var("PROPMONITOR_NO_BROWSER").is_err() {
+        let url = browser_url.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Err(e) = webbrowser::open(&url) {
+                eprintln!("propmonitor: could not open browser: {}", e);
+            }
+        });
+    }
+
+    // Keep the tokio runtime alive for the lifetime of the process. The
+    // tray event loop will own the main thread; when "Quit" is selected
+    // it calls process::exit which tears the runtime down with it.
+    //
+    // The runtime is moved into a `Box::leak`-style static so it isn't
+    // dropped at the end of main; otherwise `tray::run` would `loop {}`
+    // happily but the spawned tasks would be cancelled by Drop.
+    let _rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
+
+    // Run the tray on the main thread. If the OS doesn't have a tray
+    // (headless Linux over SSH, missing libayatana-appindicator, etc.)
+    // fall back to a Ctrl+C-driven park so the server still runs.
+    match tray::run(browser_url) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!(
+                "propmonitor: tray unavailable ({}), running headless — Ctrl+C to exit",
+                e
+            );
+            std::thread::park();
+            Ok(())
+        }
+    }
 }
 
-fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-    rx: &mpsc::Receiver<WorkerEvent>,
-    stop: &Arc<AtomicBool>,
-    tick: Duration,
-) -> Result<()> {
-    loop {
-        // Drain any worker events that have arrived.
-        loop {
-            match rx.try_recv() {
-                Ok(WorkerEvent::WindowStarted { at }) => app.on_window_started(at),
-                Ok(WorkerEvent::FrameTick { in_band_dbfs }) => app.on_frame_tick(in_band_dbfs),
-                Ok(WorkerEvent::WindowComplete(m)) => app.on_window_complete(m),
-                Ok(WorkerEvent::Q65Decodes(rows)) => app.on_q65_decodes(rows),
-                Ok(WorkerEvent::Error(e)) => {
-                    app.error = Some(e);
-                    app.should_quit = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    app.should_quit = true;
-                    break;
-                }
-            }
-        }
+async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
+    let broadcaster = new_broadcaster();
+    let (upload_tx, upload_rx) = new_event_channel();
+    let config_arc = Arc::new(RwLock::new(cfg.clone()));
+    let uploader_status_arc = Arc::new(RwLock::new(UploaderStatus::default()));
 
-        terminal.draw(|f| render(f, app))?;
+    let state = Arc::new(AppState {
+        config_path,
+        config: config_arc.clone(),
+        broadcaster: broadcaster.clone(),
+        store: RwLock::new(MeasurementStore::new()),
+        last_raw_dbfs: RwLock::new(None),
+        device_info: RwLock::new(None),
+        uploader_status: uploader_status_arc.clone(),
+        worker_handle: StdMutex::new(None),
+    });
 
-        if app.should_quit {
-            stop.store(true, Ordering::Relaxed);
-            return Ok(());
-        }
-
-        // Poll keyboard with the render-tick budget so the loop wakes up at
-        // ~30 Hz even when nothing is happening.
-        if event::poll(tick).context("event::poll failed")? {
-            if let Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) = event::read().context("event::read failed")?
-            {
-                let quit = matches!(code, KeyCode::Char('q') | KeyCode::Esc)
-                    || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL));
-                if quit {
-                    stop.store(true, Ordering::Relaxed);
-                    return Ok(());
-                }
-            }
-        }
+    {
+        let handle = spawn_worker_and_bridge(state.clone(), cfg.clone());
+        *state.worker_handle.lock().unwrap() = Some(handle);
     }
+
+    {
+        let cfg = config_arc.clone();
+        let status = uploader_status_arc.clone();
+        let measurements_rx = broadcaster.subscribe();
+        let upload_tx = upload_tx.clone();
+        tokio::spawn(async move {
+            crate::uploader::run(cfg, measurements_rx, upload_tx, status).await;
+        });
+    }
+
+    {
+        let state_for_uploads = state.clone();
+        tokio::spawn(forward_upload_events(state_for_uploads, upload_rx));
+    }
+
+    Ok(state)
+}
+
+/// Turn a config `http.bind` value into a URL the user's browser can
+/// actually reach. `0.0.0.0` and `::` mean "listen on all interfaces"
+/// to the OS, but browsers can't connect to those — they need a real
+/// loopback or hostname.
+fn browser_url_from_bind(bind: &str) -> String {
+    let port = bind
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(5760);
+    format!("http://127.0.0.1:{}", port)
 }

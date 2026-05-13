@@ -2,8 +2,6 @@ use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
-use crate::config::Mode;
-
 pub const FFT_SIZE: usize = 16_384;
 
 #[derive(Debug, Clone, Copy)]
@@ -28,10 +26,10 @@ pub struct SpectrumAnalyzer {
     window_energy: f64,
     sample_rate: f64,
 
-    // Streaming accumulator state. `start_window` resets these and locks in
-    // a mode; `add_frame` updates them; `finalize` consumes them and
-    // produces a Measurement.
-    accum_mode: Option<Mode>,
+    // Streaming accumulator state. `start_window` resets these and locks
+    // in a passband; `add_frame` updates them; `finalize` consumes them
+    // and produces a Measurement.
+    window_open: bool,
     sig_lo: usize,
     sig_hi: usize,
     half_width_bins: usize,
@@ -61,7 +59,7 @@ impl SpectrumAnalyzer {
             window,
             window_energy,
             sample_rate,
-            accum_mode: None,
+            window_open: false,
             sig_lo: 0,
             sig_hi: 0,
             half_width_bins: 0,
@@ -74,9 +72,8 @@ impl SpectrumAnalyzer {
     }
 
     /// Begin a new measurement window. Resets all accumulators and
-    /// pre-computes the signal-bin range for `mode`.
-    pub fn start_window(&mut self, mode: Mode) {
-        let (offset_hz, width_hz) = mode.passband();
+    /// pre-computes the signal-bin range from the supplied passband.
+    pub fn start_window(&mut self, offset_hz: f64, width_hz: f64) {
         let bin_hz = self.sample_rate / FFT_SIZE as f64;
         let center_bin = FFT_SIZE as isize / 2;
         let offset_bins = (offset_hz / bin_hz).round() as isize;
@@ -93,7 +90,7 @@ impl SpectrumAnalyzer {
         self.sig_peak_power = 0.0;
         self.sig_sum_power = 0.0;
         self.frame_count = 0;
-        self.accum_mode = Some(mode);
+        self.window_open = true;
     }
 
     /// Process exactly one FFT_SIZE-sample frame. The signal-bin range from
@@ -103,7 +100,7 @@ impl SpectrumAnalyzer {
     /// drive a live activity meter without re-running the FFT.
     pub fn add_frame(&mut self, frame: &[Complex32]) -> f64 {
         debug_assert_eq!(frame.len(), FFT_SIZE);
-        debug_assert!(self.accum_mode.is_some(), "start_window not called");
+        debug_assert!(self.window_open, "start_window not called");
 
         for (i, &s) in frame.iter().enumerate() {
             let w = self.window[i];
@@ -133,15 +130,15 @@ impl SpectrumAnalyzer {
     }
 
     /// Finalize the current measurement window and return the result.
-    /// Clears `accum_mode` so a stale window can't be accidentally reused
+    /// Clears `window_open` so a stale window can't be accidentally reused
     /// without calling `start_window` again.
     pub fn finalize(&mut self) -> Option<Measurement> {
-        if self.frame_count == 0 || self.accum_mode.is_none() {
-            self.accum_mode = None;
+        if self.frame_count == 0 || !self.window_open {
+            self.window_open = false;
             return None;
         }
         if self.sig_hi <= self.sig_lo {
-            self.accum_mode = None;
+            self.window_open = false;
             return None;
         }
         let signal_bin_count = self.sig_hi - self.sig_lo + 1;
@@ -168,7 +165,7 @@ impl SpectrumAnalyzer {
             .map(|(_, &p)| p)
             .collect();
         if noise_bins.is_empty() {
-            self.accum_mode = None;
+            self.window_open = false;
             return None;
         }
         noise_bins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -178,7 +175,7 @@ impl SpectrumAnalyzer {
         let sig_avg_power = (self.sig_sum_power / frames as f64).max(1e-30);
         let sig_peak_power = self.sig_peak_power.max(1e-30);
 
-        self.accum_mode = None;
+        self.window_open = false;
 
         Some(Measurement {
             noise_dbfs: 10.0 * noise_power.log10(),
@@ -192,8 +189,13 @@ impl SpectrumAnalyzer {
     /// Batch convenience: start a window, feed every full FFT_SIZE chunk
     /// from `samples`, finalize. Used by tests and as a sanity wrapper.
     #[cfg(test)]
-    pub fn analyze(&mut self, samples: &[Complex32], mode: Mode) -> Option<Measurement> {
-        self.start_window(mode);
+    pub fn analyze(
+        &mut self,
+        samples: &[Complex32],
+        offset_hz: f64,
+        width_hz: f64,
+    ) -> Option<Measurement> {
+        self.start_window(offset_hz, width_hz);
         for frame in samples.chunks_exact(FFT_SIZE) {
             self.add_frame(frame);
         }
@@ -222,7 +224,7 @@ mod tests {
             samples.push(Complex32::new(phase.cos(), phase.sin()));
         }
 
-        let m = analyzer.analyze(&samples, Mode::Usb).unwrap();
+        let m = analyzer.analyze(&samples, 1_500.0, 2_700.0).unwrap();
         assert!(
             m.snr_peak_db > 40.0,
             "clean tone should give >40 dB peak SNR, got {}",
@@ -258,8 +260,8 @@ mod tests {
             }
         }
 
-        let full = analyzer.analyze(&always_on, Mode::Cw).unwrap();
-        let keyed = analyzer.analyze(&half_keyed, Mode::Cw).unwrap();
+        let full = analyzer.analyze(&always_on, 700.0, 500.0).unwrap();
+        let keyed = analyzer.analyze(&half_keyed, 700.0, 500.0).unwrap();
 
         let delta = (full.signal_peak_dbfs - keyed.signal_peak_dbfs).abs();
         assert!(
@@ -289,7 +291,7 @@ mod tests {
     fn add_frame_returns_per_frame_in_band_power() {
         let sr = 2_000_000.0;
         let mut analyzer = SpectrumAnalyzer::new(sr);
-        analyzer.start_window(Mode::Cw);
+        analyzer.start_window(700.0, 500.0);
 
         // Frame 1: clean 700 Hz tone (middle of CW passband)
         let mut tone_frame = Vec::with_capacity(FFT_SIZE);
@@ -338,7 +340,7 @@ mod tests {
             samples.push(Complex32::new(phase.cos(), phase.sin()));
         }
 
-        let m = analyzer.analyze(&samples, Mode::Usb).unwrap();
+        let m = analyzer.analyze(&samples, 1_500.0, 2_700.0).unwrap();
         assert!(
             m.snr_peak_db < 20.0,
             "out-of-band tone should not score as signal, got peak SNR {}",

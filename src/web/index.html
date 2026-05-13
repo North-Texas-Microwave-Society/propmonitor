@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>propmonitor</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header id="header">
+    <span id="hdr-summary">connecting…</span>
+    <span id="hdr-raw" class="muted"></span>
+  </header>
+
+  <section id="waterfall-section">
+    <canvas id="waterfall" width="1024" height="240"></canvas>
+    <div id="freq-axis"></div>
+  </section>
+
+  <section id="readout">
+    <div class="row">
+      <span class="label">noise</span><span id="ro-noise" class="value">—</span>
+      <span class="label">peak</span><span id="ro-peak" class="value">—</span>
+      <span class="label">avg</span><span id="ro-avg" class="value">—</span>
+      <span class="label">SNR (peak)</span><span id="ro-snr-peak" class="value">—</span>
+    </div>
+    <div class="row muted">
+      <span id="ro-upload">uploader: —</span>
+      <span id="ro-meas-at"></span>
+    </div>
+  </section>
+
+  <section id="settings-section">
+    <details open>
+      <summary>Settings</summary>
+      <form id="settings-form" autocomplete="off">
+        <div class="grid">
+          <label>SDR device
+            <span class="driver-row">
+              <select name="driver"></select>
+              <button type="button" id="refresh-devices" title="Re-scan for SDR devices">↻</button>
+            </span>
+          </label>
+          <label>frequency (Hz)<input name="frequency" type="number" step="1"></label>
+          <label>mode<select name="mode">
+            <option value="beacon">beacon</option>
+            <option value="cw">cw</option>
+            <option value="usb">usb</option>
+            <option value="lsb">lsb</option>
+            <option value="am">am</option>
+            <option value="nfm">nfm</option>
+            <option value="wfm">wfm</option>
+          </select></label>
+          <label>sample_rate<input name="sample_rate" type="number" step="1"></label>
+          <label>gain<input name="gain" type="number" step="0.1"></label>
+          <label>ppm<input name="ppm" type="number" step="0.1"></label>
+        </div>
+
+        <fieldset>
+          <legend>beacon (passband for mode=beacon)</legend>
+          <label>offset_hz<input name="beacon_offset_hz" type="number" step="1"></label>
+          <label>bandwidth_hz<input name="beacon_bandwidth_hz" type="number" step="1"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>http</legend>
+          <label>bind<input name="http_bind" type="text"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>microwaveprop</legend>
+          <label class="checkbox">
+            <input name="mw_enabled" type="checkbox">
+            Send beacon reports
+          </label>
+          <label>monitor_token<input name="mw_token" type="password" placeholder="leave as 'redacted' to keep"></label>
+          <label>beacon_callsign<input name="mw_callsign" type="text"></label>
+        </fieldset>
+
+        <div class="actions">
+          <button type="submit">Save &amp; Apply</button>
+          <span id="save-status"></span>
+        </div>
+      </form>
+    </details>
+  </section>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

@@ -9,7 +9,7 @@ pub enum Mode {
     Nfm,
     Wfm,
     Cw,
-    Q65,
+    Beacon,
 }
 
 impl Mode {
@@ -21,38 +21,65 @@ impl Mode {
             "nfm" => Mode::Nfm,
             "wfm" => Mode::Wfm,
             "cw" => Mode::Cw,
-            "q65" => Mode::Q65,
+            "beacon" => Mode::Beacon,
             other => {
                 return Err(Error::msg(format!(
-                    "config: unknown mode {:?} (expected usb|lsb|am|nfm|wfm|cw|q65)",
+                    "config: unknown mode {:?} (expected usb|lsb|am|nfm|wfm|cw|beacon)",
                     other
                 )));
             }
         })
     }
 
-    /// Returns (offset_hz, bandwidth_hz) for this mode's passband,
-    /// measured relative to the tuned center frequency.
-    pub fn passband(self) -> (f64, f64) {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Mode::Usb => (1_500.0, 2_700.0),
-            Mode::Lsb => (-1_500.0, 2_700.0),
-            Mode::Am => (0.0, 6_000.0),
-            Mode::Nfm => (0.0, 12_500.0),
-            Mode::Wfm => (0.0, 150_000.0),
-            Mode::Cw => (700.0, 500.0),
-            Mode::Q65 => (0.0, 430.0),
+            Mode::Usb => "usb",
+            Mode::Lsb => "lsb",
+            Mode::Am => "am",
+            Mode::Nfm => "nfm",
+            Mode::Wfm => "wfm",
+            Mode::Cw => "cw",
+            Mode::Beacon => "beacon",
         }
     }
 }
 
+/// Per-mode (offset_hz, bandwidth_hz). For beacon mode the caller passes in
+/// the user-configured beacon offset+bandwidth; everything else has a
+/// fixed default.
+pub fn passband_for(mode: Mode, beacon: Option<&BeaconConfig>) -> (f64, f64) {
+    match mode {
+        Mode::Usb => (1_500.0, 2_700.0),
+        Mode::Lsb => (-1_500.0, 2_700.0),
+        Mode::Am => (0.0, 6_000.0),
+        Mode::Nfm => (0.0, 12_500.0),
+        Mode::Wfm => (0.0, 150_000.0),
+        Mode::Cw => (700.0, 500.0),
+        Mode::Beacon => beacon
+            .map(|b| (b.offset_hz, b.bandwidth_hz))
+            .unwrap_or((0.0, 50.0)),
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct Q65Config {
-    /// Only "60C" accepted in MVP.
-    pub submode: String,
-    pub audio_center_hz: f64,
-    pub audio_search_hz: f64,
-    pub max_decodes_per_period: usize,
+pub struct BeaconConfig {
+    pub offset_hz: f64,
+    pub bandwidth_hz: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpConfig {
+    pub bind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MicrowavepropConfig {
+    /// Whether the uploader actually POSTs measurements. Lets the
+    /// operator save credentials but pause reporting without losing
+    /// them (e.g. during station maintenance, antenna swaps, testing).
+    pub enabled: bool,
+    pub monitor_token: String,
+    pub beacon_callsign: String,
 }
 
 #[derive(Debug, Clone)]
@@ -61,13 +88,25 @@ pub struct Config {
     pub mode: Mode,
     pub sample_rate: f64,
     pub gain: Option<f64>,
-    pub q65: Option<Q65Config>,
+    /// SoapySDR driver name (e.g. "sdrplay", "rtlsdr"). Defaults to "rtlsdr".
+    pub driver: String,
+    /// Frequency-error correction in PPM applied to the tuner. 0 for TCXO devices.
+    pub ppm: f64,
+    /// Measurement integration window in seconds.
+    pub period_seconds: u32,
+    pub beacon: Option<BeaconConfig>,
+    pub http: HttpConfig,
+    pub microwaveprop: Option<MicrowavepropConfig>,
 }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let map = yaml::parse(&text)?;
+        Self::from_yaml_str(&text)
+    }
+
+    pub fn from_yaml_str(text: &str) -> Result<Self> {
+        let map = yaml::parse(text)?;
 
         let frequency = yaml::parse_f64(yaml::require_scalar(&map, "frequency")?, "frequency")?;
         let mode = Mode::parse(yaml::require_scalar(&map, "mode")?)?;
@@ -78,7 +117,7 @@ impl Config {
                     .ok_or_else(|| Error::msg("config: `sample_rate` must be a scalar"))?,
                 "sample_rate",
             )?,
-            None => 2_000_000.0,
+            None => 250_000.0,
         };
 
         let gain = match map.get("gain") {
@@ -90,42 +129,108 @@ impl Config {
             None => None,
         };
 
-        let q65 = match map.get("q65") {
+        let driver = match map.get("driver") {
+            Some(v) => v
+                .as_scalar()
+                .ok_or_else(|| Error::msg("config: `driver` must be a scalar"))?
+                .to_string(),
+            None => "rtlsdr".to_string(),
+        };
+
+        let ppm = match map.get("ppm") {
+            Some(v) => yaml::parse_f64(
+                v.as_scalar()
+                    .ok_or_else(|| Error::msg("config: `ppm` must be a scalar"))?,
+                "ppm",
+            )?,
+            None => 0.0,
+        };
+
+        let period_seconds = match map.get("period_seconds") {
+            Some(v) => yaml::parse_usize(
+                v.as_scalar()
+                    .ok_or_else(|| Error::msg("config: `period_seconds` must be a scalar"))?,
+                "period_seconds",
+            )? as u32,
+            None => 60,
+        };
+
+        let beacon = match map.get("beacon") {
             Some(v) => {
-                let qm = v
+                let m = v
                     .as_map()
-                    .ok_or_else(|| Error::msg("config: `q65` must be a mapping"))?;
-                Some(Q65Config {
-                    submode: yaml::require_scalar(qm, "submode")?.to_string(),
-                    audio_center_hz: match qm.get("audio_center_hz") {
-                        Some(v) => yaml::parse_f64(
-                            v.as_scalar().ok_or_else(|| {
-                                Error::msg("config: `q65.audio_center_hz` must be a scalar")
-                            })?,
-                            "q65.audio_center_hz",
-                        )?,
-                        None => 1_500.0,
-                    },
-                    audio_search_hz: match qm.get("audio_search_hz") {
-                        Some(v) => yaml::parse_f64(
-                            v.as_scalar().ok_or_else(|| {
-                                Error::msg("config: `q65.audio_search_hz` must be a scalar")
-                            })?,
-                            "q65.audio_search_hz",
-                        )?,
-                        None => 200.0,
-                    },
-                    max_decodes_per_period: match qm.get("max_decodes_per_period") {
-                        Some(v) => yaml::parse_usize(
-                            v.as_scalar().ok_or_else(|| {
-                                Error::msg(
-                                    "config: `q65.max_decodes_per_period` must be a scalar",
-                                )
-                            })?,
-                            "q65.max_decodes_per_period",
-                        )?,
-                        None => 5,
-                    },
+                    .ok_or_else(|| Error::msg("config: `beacon` must be a mapping"))?;
+                let offset_hz = match m.get("offset_hz") {
+                    Some(v) => yaml::parse_f64(
+                        v.as_scalar()
+                            .ok_or_else(|| Error::msg("config: `beacon.offset_hz` must be a scalar"))?,
+                        "beacon.offset_hz",
+                    )?,
+                    None => 0.0,
+                };
+                let bandwidth_hz = match m.get("bandwidth_hz") {
+                    Some(v) => yaml::parse_f64(
+                        v.as_scalar().ok_or_else(|| {
+                            Error::msg("config: `beacon.bandwidth_hz` must be a scalar")
+                        })?,
+                        "beacon.bandwidth_hz",
+                    )?,
+                    None => 50.0,
+                };
+                Some(BeaconConfig {
+                    offset_hz,
+                    bandwidth_hz,
+                })
+            }
+            None => None,
+        };
+
+        let http = match map.get("http") {
+            Some(v) => {
+                let m = v
+                    .as_map()
+                    .ok_or_else(|| Error::msg("config: `http` must be a mapping"))?;
+                let bind = match m.get("bind") {
+                    Some(v) => v
+                        .as_scalar()
+                        .ok_or_else(|| Error::msg("config: `http.bind` must be a scalar"))?
+                        .to_string(),
+                    None => "0.0.0.0:5760".to_string(),
+                };
+                HttpConfig { bind }
+            }
+            None => HttpConfig {
+                bind: "0.0.0.0:5760".to_string(),
+            },
+        };
+
+        let microwaveprop = match map.get("microwaveprop") {
+            Some(v) => {
+                let m = v
+                    .as_map()
+                    .ok_or_else(|| Error::msg("config: `microwaveprop` must be a mapping"))?;
+                // Default: enabled. The block being present at all is
+                // already a signal of intent to report; the operator can
+                // explicitly set `enabled: false` to pause without
+                // erasing their credentials.
+                let enabled = match m.get("enabled").and_then(|v| v.as_scalar()) {
+                    Some(s) => s.parse::<bool>().unwrap_or(true),
+                    None => true,
+                };
+                let monitor_token = m
+                    .get("monitor_token")
+                    .and_then(|v| v.as_scalar())
+                    .unwrap_or("")
+                    .to_string();
+                let beacon_callsign = m
+                    .get("beacon_callsign")
+                    .and_then(|v| v.as_scalar())
+                    .unwrap_or("")
+                    .to_string();
+                Some(MicrowavepropConfig {
+                    enabled,
+                    monitor_token,
+                    beacon_callsign,
                 })
             }
             None => None,
@@ -136,23 +241,47 @@ impl Config {
             mode,
             sample_rate,
             gain,
-            q65,
+            driver,
+            ppm,
+            period_seconds,
+            beacon,
+            http,
+            microwaveprop,
         };
 
-        if cfg.mode == Mode::Q65 {
-            let q = cfg
-                .q65
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.frequency <= 0.0 {
+            return Err(Error::msg("config: frequency must be positive"));
+        }
+        if self.sample_rate < 250_000.0 {
+            return Err(Error::msg(
+                "config: sample_rate must be at least 250000 Hz (lower rates pin the waterfall bin width too high)",
+            ));
+        }
+        if self.period_seconds < 5 {
+            return Err(Error::msg("config: period_seconds must be at least 5"));
+        }
+        if self.mode == Mode::Beacon {
+            let b = self
+                .beacon
                 .as_ref()
-                .ok_or_else(|| Error::msg("mode: q65 requires a `q65:` config block"))?;
-            if q.submode != "60C" {
-                return Err(Error::msg(format!(
-                    "q65.submode {:?} unsupported — MVP only ships Q65-60C",
-                    q.submode
-                )));
+                .ok_or_else(|| Error::msg("config: mode=beacon requires a `beacon:` block"))?;
+            if b.bandwidth_hz <= 0.0 {
+                return Err(Error::msg(
+                    "config: beacon.bandwidth_hz must be positive",
+                ));
+            }
+            if b.bandwidth_hz > self.sample_rate / 2.0 {
+                return Err(Error::msg(
+                    "config: beacon.bandwidth_hz exceeds sample_rate/2",
+                ));
             }
         }
-
-        Ok(cfg)
+        Ok(())
     }
 }
 
@@ -161,53 +290,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_minimal_analog_config() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("propmonitor_test_minimal.yaml");
-        std::fs::write(&path, "frequency: 101100000\nmode: wfm\n").unwrap();
-        let cfg = Config::load(path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.frequency, 101_100_000.0);
-        assert_eq!(cfg.mode, Mode::Wfm);
-        assert_eq!(cfg.sample_rate, 2_000_000.0);
-        assert!(cfg.gain.is_none());
-        assert!(cfg.q65.is_none());
+    fn parses_minimal_beacon_config() {
+        let yaml = "\
+frequency: 28330000
+mode: beacon
+sample_rate: 250000
+gain: 10
+beacon:
+  offset_hz: 0
+  bandwidth_hz: 50
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.frequency, 28_330_000.0);
+        assert_eq!(cfg.mode, Mode::Beacon);
+        assert_eq!(cfg.gain, Some(10.0));
+        let b = cfg.beacon.unwrap();
+        assert_eq!(b.offset_hz, 0.0);
+        assert_eq!(b.bandwidth_hz, 50.0);
+        assert!(cfg.microwaveprop.is_none());
+        assert_eq!(cfg.http.bind, "0.0.0.0:5760");
+        assert_eq!(cfg.period_seconds, 60);
     }
 
     #[test]
-    fn parses_full_q65_config() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("propmonitor_test_q65.yaml");
-        std::fs::write(
-            &path,
-            "frequency: 50211000\nmode: q65\nsample_rate: 2000000\ngain: 40\nq65:\n  submode: \"60C\"\n  audio_center_hz: 1500\n  audio_search_hz: 200\n  max_decodes_per_period: 5\n",
-        )
-        .unwrap();
-        let cfg = Config::load(path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.mode, Mode::Q65);
-        assert_eq!(cfg.gain, Some(40.0));
-        let q = cfg.q65.unwrap();
-        assert_eq!(q.submode, "60C");
-        assert_eq!(q.audio_center_hz, 1500.0);
-        assert_eq!(q.max_decodes_per_period, 5);
+    fn rejects_beacon_mode_without_beacon_block() {
+        let yaml = "frequency: 28330000\nmode: beacon\nsample_rate: 250000\n";
+        assert!(Config::from_yaml_str(yaml).is_err());
     }
 
     #[test]
-    fn rejects_q65_mode_without_q65_block() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("propmonitor_test_q65_missing.yaml");
-        std::fs::write(&path, "frequency: 50211000\nmode: q65\n").unwrap();
-        assert!(Config::load(path.to_str().unwrap()).is_err());
+    fn rejects_unknown_mode() {
+        let yaml = "frequency: 28330000\nmode: bogus\nsample_rate: 250000\n";
+        assert!(Config::from_yaml_str(yaml).is_err());
     }
 
     #[test]
-    fn rejects_unsupported_submode() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("propmonitor_test_q65_30A.yaml");
-        std::fs::write(
-            &path,
-            "frequency: 50211000\nmode: q65\nq65:\n  submode: \"30A\"\n",
-        )
-        .unwrap();
-        assert!(Config::load(path.to_str().unwrap()).is_err());
+    fn microwaveprop_defaults_to_enabled_when_block_present() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+microwaveprop:
+  monitor_token: \"token123\"
+  beacon_callsign: \"W1XYZ\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        let mw = cfg.microwaveprop.unwrap();
+        assert!(mw.enabled);
+        assert_eq!(mw.monitor_token, "token123");
+        assert_eq!(mw.beacon_callsign, "W1XYZ");
+    }
+
+    #[test]
+    fn microwaveprop_enabled_false_persists_credentials_but_pauses_uploads() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+microwaveprop:
+  enabled: false
+  monitor_token: \"token123\"
+  beacon_callsign: \"W1XYZ\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        let mw = cfg.microwaveprop.unwrap();
+        assert!(!mw.enabled);
+        assert_eq!(mw.monitor_token, "token123");
     }
 }

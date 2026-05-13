@@ -8,11 +8,11 @@
 //! The shape we accept:
 //!
 //! ```yaml
-//! frequency: 50211000
-//! mode: q65
-//! q65:
-//!   submode: "60C"
-//!   audio_center_hz: 1500
+//! frequency: 28330000
+//! mode: beacon
+//! beacon:
+//!   offset_hz: 0
+//!   bandwidth_hz: 50
 //! ```
 
 use std::collections::BTreeMap;
@@ -167,6 +167,90 @@ pub fn parse_usize(s: &str, key: &str) -> Result<usize> {
         .map_err(|_| Error::msg(format!("config: `{}` is not an integer ({:?})", key, s)))
 }
 
+// ---------------- writer ----------------------------------------------
+
+/// Helper for `Config::to_yaml_string` — builds a YAML document one line at
+/// a time. Quoting follows the same conventions as the parser: bare scalars
+/// for numbers, double-quoted for strings that contain spaces or special
+/// characters.
+pub struct YamlWriter {
+    out: String,
+}
+
+impl YamlWriter {
+    pub fn new() -> Self {
+        Self { out: String::new() }
+    }
+
+    pub fn scalar(&mut self, key: &str, value: &str) {
+        self.out.push_str(key);
+        self.out.push_str(": ");
+        self.out.push_str(value);
+        self.out.push('\n');
+    }
+
+    pub fn string(&mut self, key: &str, value: &str) {
+        self.out.push_str(key);
+        self.out.push_str(": ");
+        self.write_quoted(value);
+        self.out.push('\n');
+    }
+
+    pub fn nested_open(&mut self, key: &str) {
+        self.out.push_str(key);
+        self.out.push_str(":\n");
+    }
+
+    pub fn nested_scalar(&mut self, key: &str, value: &str) {
+        self.out.push_str("  ");
+        self.out.push_str(key);
+        self.out.push_str(": ");
+        self.out.push_str(value);
+        self.out.push('\n');
+    }
+
+    pub fn nested_string(&mut self, key: &str, value: &str) {
+        self.out.push_str("  ");
+        self.out.push_str(key);
+        self.out.push_str(": ");
+        self.write_quoted(value);
+        self.out.push('\n');
+    }
+
+    fn write_quoted(&mut self, value: &str) {
+        self.out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => self.out.push_str("\\\""),
+                '\\' => self.out.push_str("\\\\"),
+                _ => self.out.push(ch),
+            }
+        }
+        self.out.push('"');
+    }
+
+    pub fn finish(self) -> String {
+        self.out
+    }
+}
+
+/// Atomically replace `path` with `contents`. Writes to `<path>.tmp` first,
+/// fsyncs, then renames over the destination.
+pub fn write_atomic(path: &str, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let tmp = format!("{}.tmp", path);
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| Error::msg(format!("create {}: {}", tmp, e)))?;
+    f.write_all(contents.as_bytes())
+        .map_err(|e| Error::msg(format!("write {}: {}", tmp, e)))?;
+    f.sync_all()
+        .map_err(|e| Error::msg(format!("fsync {}: {}", tmp, e)))?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+        .map_err(|e| Error::msg(format!("rename {} -> {}: {}", tmp, path, e)))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,20 +280,20 @@ mod tests {
     #[test]
     fn parses_nested_block() {
         let yaml = "\
-mode: q65
-q65:
-  submode: \"60C\"
-  audio_center_hz: 1500
+mode: beacon
+beacon:
+  offset_hz: 0
+  bandwidth_hz: 50
 ";
         let m = parse(yaml).unwrap();
-        let q = m.get("q65").unwrap().as_map().unwrap();
-        assert_eq!(q.get("submode").unwrap().as_scalar(), Some("60C"));
-        assert_eq!(q.get("audio_center_hz").unwrap().as_scalar(), Some("1500"));
+        let b = m.get("beacon").unwrap().as_map().unwrap();
+        assert_eq!(b.get("offset_hz").unwrap().as_scalar(), Some("0"));
+        assert_eq!(b.get("bandwidth_hz").unwrap().as_scalar(), Some("50"));
     }
 
     #[test]
     fn rejects_deeper_indent() {
-        let yaml = "q65:\n    nested: x\n";
+        let yaml = "beacon:\n    nested: x\n";
         assert!(parse(yaml).is_err());
     }
 

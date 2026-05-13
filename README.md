@@ -1,35 +1,96 @@
 # propmonitor
 
-A small Rust CLI for monitoring radio propagation conditions with a software-defined radio. It tunes an SDR to a configured frequency and mode, captures IQ samples, and once per minute reports the noise floor, in-band signal level (both peak and average), and SNR in dB.
+Headless beacon-signal-level monitor. Tunes an SDR (RTL-SDR, SDRplay,
+anything SoapySDR can drive), measures noise floor + signal level + SNR
+over a configurable integration window, and uploads the measurements to
+[microwaveprop](https://codeberg.org/grahammc/microwaveprop) so beacon
+strength can be correlated with weather over time.
 
-It's intended for unattended, long-running captures — for example, watching a beacon, a broadcast carrier, or a band segment over hours or days to get a sense of how propagation is shifting.
-
-## Status
-
-This is only validated to work on a Mac with an RSP1A SDR.
+Includes a live web UI (waterfall, dBFS readout, settings form) on
+`http://127.0.0.1:5760` and a system-tray icon. On startup it auto-opens
+your default browser.
 
 ## Requirements
 
-- Rust toolchain (stable)
-- [SoapySDR](https://github.com/pothosware/SoapySDR) and the [SoapySDRPlay](https://github.com/pothosware/SoapySDRPlay3) driver
-- An SDRplay RSP1A
+- Rust stable
+- [SoapySDR](https://github.com/pothosware/SoapySDR) + the driver module
+  for your dongle (`soapysdr-module-rtlsdr`, `soapysdr-module-sdrplay`,
+  etc.)
+- For Linux: `libayatana-appindicator3-dev` (for the tray icon)
 
-## Usage
+### macOS
 
 ```bash
-cargo run --release                    # uses ./config.yaml
-cargo run --release -- my-config.yaml  # explicit config path
+brew install soapysdr soapyrtlsdr
 ```
+
+### Debian/Ubuntu Linux
+
+```bash
+sudo apt install libsoapysdr-dev soapysdr-module-rtlsdr libayatana-appindicator3-dev librtlsdr-dev
+```
+
+### Windows
+
+See [`windows_build.md`](./windows_build.md).
+
+## Build & run
+
+```bash
+cargo build --release
+./target/release/propmonitor               # uses ./config.yaml
+./target/release/propmonitor my-config.yaml
+```
+
+The tray icon should appear, and your browser should open to
+`http://127.0.0.1:5760`. The web UI exposes everything: live waterfall,
+signal/noise readout, full settings form (changes are persisted to
+`config.yaml` and apply immediately via worker restart).
 
 ## Configuration
 
-`config.yaml` controls the tuned frequency, demodulation mode, sample rate, and gain:
+`config.yaml`:
 
 ```yaml
-frequency: 101100000   # Hz
-mode: wfm              # usb | lsb | am | nfm | wfm | cw
-sample_rate: 2000000   # optional, default 2_000_000
-gain: 40               # optional, dB; omit for AGC
+frequency: 28330000           # Hz, tuned center frequency
+mode: beacon                   # usb | lsb | am | nfm | wfm | cw | beacon
+driver: "rtlsdr,serial=…"      # SoapySDR driver args
+sample_rate: 250000            # Hz
+gain: 10                       # dB; omit for AGC
+ppm: 0
+period_seconds: 60             # measurement integration window
+
+beacon:                        # required when mode == beacon
+  offset_hz: 0                 # passband center, relative to `frequency`
+  bandwidth_hz: 50             # narrow window for tight CW beacon carriers
+
+http:
+  bind: "0.0.0.0:5760"         # LAN-accessible by default
+
+# Optional: enable uploads to microwaveprop. Omit to run UI-only.
+# Toggle on/off with the "Send beacon reports" checkbox in the web UI.
+# The ingest URL is hardcoded in src/uploader.rs (MICROWAVEPROP_ENDPOINT).
+# microwaveprop:
+#   enabled: true
+#   monitor_token: "…"
+#   beacon_callsign: "W1XYZ"
 ```
 
-The `mode` selects the passband used for in-band signal measurement and for excluding those bins from the noise-floor estimate.
+See [`api.md`](./api.md) for the full REST/WebSocket/upload contract.
+
+## Diagnostics
+
+`sdr_diag` is a standalone tool for debugging device-level issues
+without going through the main server:
+
+```bash
+./target/release/sdr_diag --driver "rtlsdr" --freq 28330000 --rate 1000000 --gain 10 --duration 30
+```
+
+It prints per-second RMS, top spectral peaks, and a small ASCII spectrum
+plot around DC. Useful when the waterfall in the web UI looks wrong and
+you want to rule out the web/DSP path.
+
+## License
+
+GPL-3.0-or-later. See [`LICENSE`](./LICENSE).
