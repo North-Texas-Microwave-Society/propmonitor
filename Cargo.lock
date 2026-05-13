@@ -1941,6 +1941,7 @@ dependencies = [
  "soapysdr",
  "tao",
  "tokio",
+ "tower",
  "tray-icon",
  "webbrowser",
 ]

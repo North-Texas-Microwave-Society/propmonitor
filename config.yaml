@@ -17,4 +17,4 @@ http:
 # microwaveprop:
 #   enabled: true
 #   monitor_token: "your-monitor-token-here"
-#   beacon_callsign: "W1XYZ"
+#   beacon_id: "your-beacon-uuid-here"

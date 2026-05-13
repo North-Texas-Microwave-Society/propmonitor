@@ -79,7 +79,10 @@ pub struct MicrowavepropConfig {
     /// them (e.g. during station maintenance, antenna swaps, testing).
     pub enabled: bool,
     pub monitor_token: String,
-    pub beacon_callsign: String,
+    /// UUID of the beacon being monitored. Canonical key on the
+    /// microwaveprop side — replaces callsign-based identification so
+    /// duplicate or unregistered callsigns can't confuse routing.
+    pub beacon_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -222,15 +225,15 @@ impl Config {
                     .and_then(|v| v.as_scalar())
                     .unwrap_or("")
                     .to_string();
-                let beacon_callsign = m
-                    .get("beacon_callsign")
+                let beacon_id = m
+                    .get("beacon_id")
                     .and_then(|v| v.as_scalar())
                     .unwrap_or("")
                     .to_string();
                 Some(MicrowavepropConfig {
                     enabled,
                     monitor_token,
-                    beacon_callsign,
+                    beacon_id,
                 })
             }
             None => None,
@@ -332,13 +335,231 @@ mode: cw
 sample_rate: 250000
 microwaveprop:
   monitor_token: \"token123\"
-  beacon_callsign: \"W1XYZ\"
+  beacon_id: \"00000000-0000-0000-0000-000000000001\"
 ";
         let cfg = Config::from_yaml_str(yaml).unwrap();
         let mw = cfg.microwaveprop.unwrap();
         assert!(mw.enabled);
         assert_eq!(mw.monitor_token, "token123");
-        assert_eq!(mw.beacon_callsign, "W1XYZ");
+        assert_eq!(mw.beacon_id, "00000000-0000-0000-0000-000000000001");
+    }
+
+    #[test]
+    fn rejects_zero_or_negative_frequency() {
+        let yaml = "frequency: 0\nmode: cw\nsample_rate: 250000\n";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_sample_rate_below_250k() {
+        let yaml = "frequency: 28330000\nmode: cw\nsample_rate: 100000\n";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_period_seconds_below_five() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+period_seconds: 1
+";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_beacon_bandwidth_zero_or_negative() {
+        let yaml = "\
+frequency: 28330000
+mode: beacon
+sample_rate: 250000
+beacon:
+  offset_hz: 0
+  bandwidth_hz: 0
+";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_beacon_bandwidth_above_nyquist() {
+        let yaml = "\
+frequency: 28330000
+mode: beacon
+sample_rate: 250000
+beacon:
+  offset_hz: 0
+  bandwidth_hz: 200000
+";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn uses_default_sample_rate_when_missing() {
+        // No sample_rate key — defaults to 250000.
+        let yaml = "frequency: 28330000\nmode: cw\n";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.sample_rate, 250_000.0);
+    }
+
+    #[test]
+    fn beacon_block_omitting_offset_uses_default_zero() {
+        // beacon block present, offset_hz missing → defaults to 0.0.
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+beacon:
+  bandwidth_hz: 50
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        let b = cfg.beacon.unwrap();
+        assert_eq!(b.offset_hz, 0.0);
+        assert_eq!(b.bandwidth_hz, 50.0);
+    }
+
+    #[test]
+    fn http_block_omitting_bind_uses_default() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+http:
+  bind: \"127.0.0.1:1234\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.http.bind, "127.0.0.1:1234");
+
+        // Empty http block (no bind key) → default bind.
+        // The minimal YAML parser requires a value on the parent if
+        // there's no nested content, so we can't write a truly empty
+        // block. We can write one with an unrelated key — but the parser
+        // would reject unknown keys at that nesting level. The default
+        // path is therefore only reachable by omitting `http:` entirely,
+        // which is already covered by `applies_defaults_when_optional_fields_missing`.
+    }
+
+    #[test]
+    fn applies_defaults_when_optional_fields_missing() {
+        let yaml = "frequency: 28330000\nmode: cw\nsample_rate: 250000\n";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.driver, "rtlsdr");
+        assert_eq!(cfg.ppm, 0.0);
+        assert_eq!(cfg.period_seconds, 60);
+        assert!(cfg.gain.is_none());
+        assert_eq!(cfg.http.bind, "0.0.0.0:5760");
+    }
+
+    #[test]
+    fn parses_every_mode_keyword() {
+        for (s, m) in [
+            ("usb", Mode::Usb),
+            ("lsb", Mode::Lsb),
+            ("am", Mode::Am),
+            ("nfm", Mode::Nfm),
+            ("wfm", Mode::Wfm),
+            ("cw", Mode::Cw),
+            ("beacon", Mode::Beacon),
+        ] {
+            assert_eq!(Mode::parse(s).unwrap(), m);
+            assert_eq!(m.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn passband_for_returns_mode_defaults() {
+        assert_eq!(passband_for(Mode::Usb, None), (1500.0, 2700.0));
+        assert_eq!(passband_for(Mode::Lsb, None), (-1500.0, 2700.0));
+        assert_eq!(passband_for(Mode::Am, None), (0.0, 6000.0));
+        assert_eq!(passband_for(Mode::Nfm, None), (0.0, 12500.0));
+        assert_eq!(passband_for(Mode::Wfm, None), (0.0, 150000.0));
+        assert_eq!(passband_for(Mode::Cw, None), (700.0, 500.0));
+    }
+
+    #[test]
+    fn passband_for_beacon_uses_user_config() {
+        let b = BeaconConfig {
+            offset_hz: 100.0,
+            bandwidth_hz: 50.0,
+        };
+        assert_eq!(passband_for(Mode::Beacon, Some(&b)), (100.0, 50.0));
+    }
+
+    #[test]
+    fn passband_for_beacon_without_block_falls_back_to_default() {
+        // Belt-and-braces — validation should reject this, but
+        // `passband_for` itself doesn't panic on `None`.
+        assert_eq!(passband_for(Mode::Beacon, None), (0.0, 50.0));
+    }
+
+    #[test]
+    fn parses_quoted_driver_string() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+driver: \"rtlsdr,serial=ABC\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.driver, "rtlsdr,serial=ABC");
+    }
+
+    #[test]
+    fn parses_non_default_ppm_and_period() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+ppm: 2.5
+period_seconds: 30
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.ppm, 2.5);
+        assert_eq!(cfg.period_seconds, 30);
+    }
+
+    #[test]
+    fn parses_custom_http_bind() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+http:
+  bind: \"127.0.0.1:9090\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.http.bind, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn parses_beacon_block_with_defaults() {
+        // beacon: with no offset/bandwidth keys gets the per-key defaults.
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+beacon:
+  offset_hz: 100
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        let b = cfg.beacon.unwrap();
+        assert_eq!(b.offset_hz, 100.0);
+        assert_eq!(b.bandwidth_hz, 50.0); // default
+    }
+
+    #[test]
+    fn load_from_disk_reads_a_real_file() {
+        let path = std::env::temp_dir().join(format!(
+            "propmonitor-config-test-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "frequency: 28330000\nmode: cw\nsample_rate: 250000\n",
+        )
+        .unwrap();
+        let cfg = Config::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.mode, Mode::Cw);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -350,7 +571,7 @@ sample_rate: 250000
 microwaveprop:
   enabled: false
   monitor_token: \"token123\"
-  beacon_callsign: \"W1XYZ\"
+  beacon_id: \"00000000-0000-0000-0000-000000000001\"
 ";
         let cfg = Config::from_yaml_str(yaml).unwrap();
         let mw = cfg.microwaveprop.unwrap();

@@ -53,3 +53,57 @@ impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
         self.map_err(|e| Error(format!("{}: {}", f(), e)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msg_constructor_and_display_round_trip() {
+        let e = Error::msg("something went wrong");
+        assert_eq!(format!("{}", e), "something went wrong");
+    }
+
+    #[test]
+    fn from_io_error_carries_message() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let e: Error = io.into();
+        assert!(format!("{}", e).contains("missing"));
+    }
+
+    #[test]
+    fn from_string_and_str() {
+        let e1: Error = String::from("a").into();
+        let e2: Error = "b".into();
+        assert_eq!(format!("{}", e1), "a");
+        assert_eq!(format!("{}", e2), "b");
+    }
+
+    #[test]
+    fn context_prefixes_static_str() {
+        let r: std::result::Result<(), &str> = Err("boom");
+        let e = r.context("widget failed").unwrap_err();
+        assert_eq!(format!("{}", e), "widget failed: boom");
+    }
+
+    #[test]
+    fn with_context_lazily_formats() {
+        let r: std::result::Result<(), &str> = Err("boom");
+        let e = r.with_context(|| format!("widget {} failed", 42)).unwrap_err();
+        assert_eq!(format!("{}", e), "widget 42 failed: boom");
+    }
+
+    #[test]
+    fn context_passes_through_ok() {
+        let r: std::result::Result<i32, &str> = Ok(7);
+        assert_eq!(r.context("ignored").unwrap(), 7);
+    }
+
+    #[test]
+    fn error_implements_std_error() {
+        // Trait-object usage forces the std::error::Error impl to compile
+        // and exercises the bound from Debug.
+        let e: Box<dyn std::error::Error> = Box::new(Error::msg("x"));
+        assert_eq!(format!("{}", e), "x");
+    }
+}

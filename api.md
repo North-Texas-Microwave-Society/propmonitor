@@ -60,7 +60,7 @@ Example:
   "microwaveprop": {
     "enabled": true,
     "monitor_token": "redacted",
-    "beacon_callsign": "W1XYZ"
+    "beacon_id": "00000000-0000-0000-0000-000000000000"
   }
 }
 ```
@@ -135,9 +135,10 @@ Returns a snapshot of the runtime state.
     "measured_at": "2026-05-13T15:30:00Z",
     "noise_floor_dbfs": -110.2,
     "signal_peak_dbfs": -88.4,
-    "signal_avg_dbfs": -92.1,
+    "signal_avg_dbfs": -89.1,
     "snr_peak_db": 21.8,
-    "snr_avg_db": 18.1
+    "snr_avg_db": 21.1,
+    "signal_active_fraction": 0.48
   },
   "uploader": {
     "enabled": true,
@@ -165,9 +166,10 @@ Response:
       "measured_at": "2026-05-13T15:30:00Z",
       "noise_floor_dbfs": -110.2,
       "signal_peak_dbfs": -88.4,
-      "signal_avg_dbfs": -92.1,
+      "signal_avg_dbfs": -89.1,
       "snr_peak_db": 21.8,
-      "snr_avg_db": 18.1
+      "snr_avg_db": 21.1,
+      "signal_active_fraction": 0.48
     },
     …
   ]
@@ -240,11 +242,17 @@ convert to dB with `10 * log10(max(value, 1e-30))`.
   "measured_at": "2026-05-13T15:30:00Z",
   "noise_floor_dbfs": -110.2,
   "signal_peak_dbfs": -88.4,
-  "signal_avg_dbfs": -92.1,
+  "signal_avg_dbfs": -89.1,
   "snr_peak_db": 21.8,
-  "snr_avg_db": 18.1
+  "snr_avg_db": 21.1,
+  "signal_active_fraction": 0.48
 }
 ```
+
+`signal_peak_dbfs` / `signal_avg_dbfs` / `snr_*_db` are computed only over
+frames whose in-band power exceeded `noise_floor + 3 dB` (signal-present
+gating). `signal_active_fraction` is the duty cycle of those frames over
+the window. See §4 for the same gating in the upload payload.
 
 #### `upload` — emitted after each microwaveprop POST attempt
 
@@ -302,7 +310,7 @@ http:
 microwaveprop:
   enabled: true                   # checkbox in the web UI
   monitor_token: "…"              # 32-byte base64-url, from POST /me/beacon-monitors
-  beacon_callsign: "W1XYZ"        # which beacon's signal we're monitoring
+  beacon_id: "…"                  # UUID of the beacon being monitored
 ```
 
 Validation rules:
@@ -314,7 +322,7 @@ Validation rules:
 - `gain` either a number or omitted.
 - `period_seconds` >= 5.
 - `beacon.bandwidth_hz` > 0 and <= `sample_rate / 2`.
-- `microwaveprop.enabled` must be `true` AND `monitor_token` must be non-empty for uploads to actually run. Either condition false → uploads paused.
+- `microwaveprop.enabled` must be `true` AND `monitor_token` must be non-empty AND `beacon_id` must be non-empty for uploads to actually run. Any of these conditions false → uploads paused.
 
 The in-tree YAML parser (`src/yaml.rs`) supports the subset used here:
 scalars (numbers, quoted/unquoted strings, comments) and one level of nesting
@@ -350,16 +358,19 @@ already used for the rest of the v1 API
 
 ```json
 {
-  "beacon_callsign":  "W1XYZ",
-  "frequency_hz":     28330000,
-  "measured_at":      "2026-05-13T15:30:00Z",
-  "integration_s":    60,
-  "passband_hz":      50,
-  "noise_floor_dbfs": -110.2,
-  "signal_peak_dbfs": -88.4,
-  "signal_avg_dbfs":  -92.1,
-  "snr_peak_db":      21.8,
-  "snr_avg_db":       18.1
+  "beacon_id":              "00000000-0000-0000-0000-000000000000",
+  "frequency_hz":           28330000,
+  "measured_at":            "2026-05-13T15:30:00Z",
+  "integration_s":          60,
+  "passband_hz":            300,
+  "gain_db":                10.0,
+  "noise_floor_dbfs":       -110.2,
+  "signal_peak_dbfs":       -88.4,
+  "signal_avg_dbfs":        -89.1,
+  "snr_peak_db":            21.8,
+  "snr_avg_db":             21.1,
+  "signal_active_fraction": 0.48,
+  "propmonitor_version":    "0.1.0"
 }
 ```
 
@@ -367,28 +378,49 @@ Field semantics:
 
 | Field | Type | Notes |
 |---|---|---|
-| `beacon_callsign` | string | Free text. Identifies *which* beacon we're listening for. Microwaveprop resolves to a beacon record (or rejects with `404` if the callsign is unknown — server policy). |
+| `beacon_id` | string (UUID) | Identifies *which* beacon this measurement is for. Canonical key on the microwaveprop side. The same monitor_token can only legitimately report for the beacon its record is associated with; mismatches are server policy. |
 | `frequency_hz` | integer | The propmonitor *tuned* frequency in Hz. Not the beacon's nominal frequency; the operator may intentionally tune slightly off to compensate for radio offset. |
 | `measured_at` | string | UTC ISO-8601 timestamp at the **start** of the integration window. |
 | `integration_s` | number | The measurement window length in seconds. Equal to `period_seconds` in propmonitor config. |
-| `passband_hz` | number | The bandwidth of the power-measurement window in Hz. Equal to `beacon.bandwidth_hz` for `mode: beacon`, or the mode-specific passband for other modes. |
+| `passband_hz` | number | The bandwidth of the power-measurement window in Hz. Operator picks this wide enough to cover whichever modes the beacon uses (e.g. ~300 Hz for a beacon that interleaves CW and Q65). |
+| `gain_db` | number | SDR gain actually reported by the device at upload time. Lets the server detect operator gain changes and rebaseline dBFS trends. With AGC on, this is whatever the tuner settled on. |
 | `noise_floor_dbfs` | number | Median of out-of-passband bin power, in dBFS. |
-| `signal_peak_dbfs` | number | Peak in-passband power across the integration window, in dBFS. Best for keyed/burst signals. |
-| `signal_avg_dbfs` | number | Time-averaged in-passband power across the window, in dBFS. Best for continuous carriers. |
+| `signal_peak_dbfs` | number | Peak in-passband power across detected-on-air frames, in dBFS. |
+| `signal_avg_dbfs` | number | Mean in-passband power across detected-on-air frames, in dBFS. Mode-invariant — see gating note below. |
 | `snr_peak_db` | number | `signal_peak_dbfs - noise_floor_dbfs`. |
 | `snr_avg_db` | number | `signal_avg_dbfs - noise_floor_dbfs`. |
+| `signal_active_fraction` | number | Fraction of FFT frames in the window where in-band power exceeded `noise_floor + 3 dB`. `1.0` = continuous carrier; `~0.5` = 50%-keyed CW; `0.0` = nothing heard. |
+| `propmonitor_version` | string | Build version of the reporting client. Diagnostic only — helps the server correlate stat shifts with client upgrades. |
 
-`dBFS` is uncalibrated — it's relative to the SDR ADC full scale and depends
-on gain. To convert to absolute power (dBm) the microwaveprop side may
-multiply by a per-monitor calibration offset; that calibration is not
-configured in propmonitor and not included in the upload.
+### Signal-present gating
+
+The peak/avg/SNR fields are computed **only** over frames whose in-band
+power exceeded `noise_floor + 3 dB` (a ×2 linear multiplier against the
+median per-bin noise estimate). This makes the signal stats
+mode-invariant: a 30%-keyed CW beacon and a continuous Q65 transmission
+with the same TX power produce the same `signal_avg_dbfs`. The duty
+cycle shows up in `signal_active_fraction` instead. The 3 dB threshold
+is hardcoded in v1.
+
+If no frames cross the threshold, `signal_active_fraction == 0.0` and
+the peak/avg fall back to ungated values (which sit near the noise
+floor; SNR ≈ 0 dB). The server should treat that case as "no signal
+heard" and either filter it out of trend lines or carry it explicitly.
+
+### Calibration
+
+`dBFS` is uncalibrated — it's relative to the SDR ADC full scale and
+depends on gain. To convert to absolute power (dBm) the microwaveprop
+side may keep a per-monitor calibration offset (possibly indexed by
+`gain_db`); that calibration is not configured in propmonitor and not
+included in the upload.
 
 ### Responses
 
 | Status | Meaning | Client behavior |
 |---|---|---|
 | `204 No Content` | Accepted, recorded. Server should update the monitor's `last_seen_at`. | Mark measurement uploaded. |
-| `400 Bad Request` | Malformed body or unknown beacon callsign. | Log, drop measurement (don't retry — schema mismatch won't fix itself). |
+| `400 Bad Request` | Malformed body or unknown `beacon_id`. | Log, drop measurement (don't retry — schema mismatch won't fix itself). |
 | `401 Unauthorized` | Bad/missing/revoked monitor token. | Log, stop uploading until config is updated. |
 | `429 Too Many Requests` | Rate limited. | Back off per `Retry-After` if present, else exponential. |
 | `5xx` | Server-side failure. | Enqueue, retry with exponential backoff (1 s → 5 min cap). |

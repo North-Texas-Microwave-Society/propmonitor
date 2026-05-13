@@ -305,4 +305,137 @@ beacon:
             Some("a # not a comment")
         );
     }
+
+    #[test]
+    fn parse_rejects_line_without_colon() {
+        assert!(parse("bare-key\n").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_key() {
+        assert!(parse(": value\n").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_orphan_nested_entry() {
+        // Two-space indent with no parent key on the line above.
+        assert!(parse("  orphan: value\n").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_double_nesting() {
+        let yaml = "outer:\n  inner:\n";
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn value_as_scalar_returns_none_for_map() {
+        let m = parse("a:\n  b: c\n").unwrap();
+        assert!(m.get("a").unwrap().as_scalar().is_none());
+    }
+
+    #[test]
+    fn value_as_map_returns_none_for_scalar() {
+        let m = parse("a: 1\n").unwrap();
+        assert!(m.get("a").unwrap().as_map().is_none());
+    }
+
+    #[test]
+    fn require_returns_missing_key_error() {
+        let m = parse("a: 1\n").unwrap();
+        assert!(require(&m, "missing").is_err());
+        assert!(require(&m, "a").is_ok());
+    }
+
+    #[test]
+    fn require_scalar_rejects_map_values() {
+        let m = parse("a:\n  b: c\n").unwrap();
+        assert!(require_scalar(&m, "a").is_err());
+    }
+
+    #[test]
+    fn parse_f64_rejects_nonsense() {
+        assert!(parse_f64("not-a-number", "x").is_err());
+        assert_eq!(parse_f64("3.14", "x").unwrap(), 3.14);
+    }
+
+    #[test]
+    fn parse_usize_rejects_negative() {
+        assert!(parse_usize("-5", "x").is_err());
+        assert_eq!(parse_usize("42", "x").unwrap(), 42);
+    }
+
+    #[test]
+    fn writer_scalar_omits_quotes_for_numbers() {
+        let mut w = YamlWriter::new();
+        w.scalar("frequency", "28330000");
+        assert_eq!(w.finish(), "frequency: 28330000\n");
+    }
+
+    #[test]
+    fn writer_string_quotes_value() {
+        let mut w = YamlWriter::new();
+        w.string("driver", "rtlsdr,serial=03340219");
+        assert_eq!(w.finish(), "driver: \"rtlsdr,serial=03340219\"\n");
+    }
+
+    #[test]
+    fn writer_nested_block_indents_two_spaces() {
+        let mut w = YamlWriter::new();
+        w.nested_open("beacon");
+        w.nested_scalar("offset_hz", "0");
+        w.nested_string("notes", "ten meter");
+        assert_eq!(
+            w.finish(),
+            "beacon:\n  offset_hz: 0\n  notes: \"ten meter\"\n"
+        );
+    }
+
+    #[test]
+    fn writer_escapes_quotes_and_backslashes() {
+        let mut w = YamlWriter::new();
+        w.string("k", r#"he said "hi" \ ok"#);
+        assert_eq!(w.finish(), "k: \"he said \\\"hi\\\" \\\\ ok\"\n");
+    }
+
+    #[test]
+    fn writer_round_trips_through_parser() {
+        let mut w = YamlWriter::new();
+        w.scalar("frequency", "28330000");
+        w.scalar("mode", "beacon");
+        w.string("driver", "rtlsdr");
+        w.nested_open("beacon");
+        w.nested_scalar("offset_hz", "0");
+        w.nested_scalar("bandwidth_hz", "300");
+        let yaml = w.finish();
+        let parsed = parse(&yaml).unwrap();
+        assert_eq!(parsed.get("frequency").unwrap().as_scalar(), Some("28330000"));
+        let b = parsed.get("beacon").unwrap().as_map().unwrap();
+        assert_eq!(b.get("bandwidth_hz").unwrap().as_scalar(), Some("300"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_file_contents() {
+        // Pick a path in the OS temp dir keyed by the test name + PID so
+        // parallel test runs don't collide.
+        let path = std::env::temp_dir().join(format!(
+            "propmonitor-yaml-test-{}.yaml",
+            std::process::id()
+        ));
+        let path_str = path.to_str().unwrap();
+        // Pre-populate so we exercise the rename-over-existing branch.
+        std::fs::write(path_str, "old: content\n").unwrap();
+
+        write_atomic(path_str, "new: content\n").unwrap();
+        let read_back = std::fs::read_to_string(path_str).unwrap();
+        assert_eq!(read_back, "new: content\n");
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn write_atomic_reports_error_on_invalid_path() {
+        let err = write_atomic("/no/such/dir/file.yaml", "x").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("create") || msg.contains("/no/such/dir"));
+    }
 }

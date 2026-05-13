@@ -105,6 +105,7 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
     let (upload_tx, upload_rx) = new_event_channel();
     let config_arc = Arc::new(RwLock::new(cfg.clone()));
     let uploader_status_arc = Arc::new(RwLock::new(UploaderStatus::default()));
+    let device_info_arc = Arc::new(RwLock::new(None));
 
     let state = Arc::new(AppState {
         config_path,
@@ -112,7 +113,7 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
         broadcaster: broadcaster.clone(),
         store: RwLock::new(MeasurementStore::new()),
         last_raw_dbfs: RwLock::new(None),
-        device_info: RwLock::new(None),
+        device_info: device_info_arc.clone(),
         uploader_status: uploader_status_arc.clone(),
         worker_handle: StdMutex::new(None),
     });
@@ -124,11 +125,12 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
 
     {
         let cfg = config_arc.clone();
+        let device_info = device_info_arc.clone();
         let status = uploader_status_arc.clone();
         let measurements_rx = broadcaster.subscribe();
         let upload_tx = upload_tx.clone();
         tokio::spawn(async move {
-            crate::uploader::run(cfg, measurements_rx, upload_tx, status).await;
+            crate::uploader::run(cfg, device_info, measurements_rx, upload_tx, status).await;
         });
     }
 

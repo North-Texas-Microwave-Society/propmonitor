@@ -17,6 +17,9 @@ tray-icon = "0.19"
 tao = "0.30"
 webbrowser = "1"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [[bin]]
 name = "propmonitor"
 path = "src/main.rs"

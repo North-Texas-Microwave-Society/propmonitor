@@ -14,6 +14,7 @@ pub struct StoredMeasurement {
     pub signal_avg_dbfs: f64,
     pub snr_peak_db: f64,
     pub snr_avg_db: f64,
+    pub signal_active_fraction: f64,
 }
 
 /// 24 hours at one measurement per minute. The server cap on `?limit=`
@@ -77,6 +78,7 @@ mod tests {
             signal_avg_dbfs: -92.0,
             snr_peak_db: 20.0,
             snr_avg_db: 18.0,
+            signal_active_fraction: 1.0,
         }
     }
 
@@ -91,6 +93,39 @@ mod tests {
         // recent push.
         let last = s.last().unwrap();
         assert_eq!(last.signal_peak_dbfs, -90.0 + (MAX_ENTRIES as f64 + 9.0));
+    }
+
+    #[test]
+    fn default_is_equivalent_to_new() {
+        let s: MeasurementStore = Default::default();
+        assert_eq!(s.len(), 0);
+        assert!(s.last().is_none());
+        assert!(s.recent(10).is_empty());
+    }
+
+    #[test]
+    fn recent_with_zero_limit_returns_empty() {
+        let mut s = MeasurementStore::new();
+        s.push(fake(0));
+        assert!(s.recent(0).is_empty());
+    }
+
+    #[test]
+    fn recent_caps_at_actual_length() {
+        let mut s = MeasurementStore::new();
+        for i in 0..3 {
+            s.push(fake(i));
+        }
+        // Asking for more than we have returns all of them.
+        assert_eq!(s.recent(100).len(), 3);
+    }
+
+    #[test]
+    fn last_returns_most_recent_push() {
+        let mut s = MeasurementStore::new();
+        s.push(fake(1));
+        s.push(fake(2));
+        assert_eq!(s.last().unwrap().signal_peak_dbfs, -90.0 + 2.0);
     }
 
     #[test]

@@ -219,7 +219,7 @@ async function loadConfig() {
   if (cfg.microwaveprop) {
     $("settings-form").mw_enabled.checked = cfg.microwaveprop.enabled !== false;
     $("settings-form").mw_token.value = cfg.microwaveprop.monitor_token || "";
-    $("settings-form").mw_callsign.value = cfg.microwaveprop.beacon_callsign || "";
+    $("settings-form").mw_beacon_id.value = cfg.microwaveprop.beacon_id || "";
   } else {
     $("settings-form").mw_enabled.checked = false;
   }
@@ -249,12 +249,12 @@ async function saveConfig(ev) {
   };
   const enabled = f.mw_enabled.checked;
   const token = f.mw_token.value;
-  const callsign = f.mw_callsign.value.trim();
-  if (enabled || token || callsign) {
+  const beaconId = f.mw_beacon_id.value.trim();
+  if (enabled || token || beaconId) {
     body.microwaveprop = {
       enabled,
       monitor_token: token,
-      beacon_callsign: callsign,
+      beacon_id: beaconId,
     };
   }
   setSaveStatus("saving…");

@@ -89,4 +89,18 @@ mod tests {
     fn negative_input_clamps_to_epoch() {
         assert_eq!(format_utc_iso8601(-1), "1970-01-01T00:00:00Z");
     }
+
+    #[test]
+    fn unix_now_secs_is_after_year_2020() {
+        // Sanity: the wall clock is post-2020 anywhere this builds.
+        let now = unix_now_secs();
+        assert!(now > 1_577_836_800, "got {}", now); // 2020-01-01
+    }
+
+    #[test]
+    fn formats_now_round_trip() {
+        let s = format_utc_iso8601(unix_now_secs());
+        assert!(s.ends_with('Z'));
+        assert_eq!(s.len(), 20); // "YYYY-MM-DDTHH:MM:SSZ"
+    }
 }
