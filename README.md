@@ -3,7 +3,7 @@
 Headless beacon-signal-level monitor. Tunes an SDR (RTL-SDR, SDRplay,
 anything SoapySDR can drive), measures noise floor + signal level + SNR
 over a configurable integration window, and uploads the measurements to
-[microwaveprop](https://codeberg.org/grahammc/microwaveprop) so beacon
+[microwaveprop](https://git.mcintire.me/grahammc/microwaveprop) so beacon
 strength can be correlated with weather over time.
 
 Includes a live web UI (waterfall, dBFS readout, settings form) on
