@@ -7,14 +7,14 @@ license = "GPL-3.0-or-later"
 [dependencies]
 num-complex = "0.4"
 rustfft = "6"
-soapysdr = "0.4"
+soapysdr = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
-axum = { version = "0.7", features = ["ws"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+axum = { version = "0.8", features = ["ws"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tray-icon = "0.19"
-tao = "0.30"
+tray-icon = "0.24"
+tao = "0.36"
 webbrowser = "1"
 
 [dev-dependencies]

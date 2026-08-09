@@ -471,7 +471,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // header data immediately rather than waiting for the next event.
     if let Some(ev) = state.device_info.read().await.clone() {
         if let Ok(s) = serde_json::to_string(&ev) {
-            let _ = socket.send(Message::Text(s)).await;
+            let _ = socket.send(Message::Text(s.into())).await;
         }
     }
 
@@ -479,7 +479,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         match rx.recv().await {
             Ok(ev) => match serde_json::to_string(&ev) {
                 Ok(s) => {
-                    if socket.send(Message::Text(s)).await.is_err() {
+                    if socket.send(Message::Text(s.into())).await.is_err() {
                         break;
                     }
                 }
