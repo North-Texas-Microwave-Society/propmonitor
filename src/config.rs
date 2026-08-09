@@ -257,13 +257,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.frequency <= 0.0 {
-            return Err(Error::msg("config: frequency must be positive"));
+        if !self.frequency.is_finite() || self.frequency <= 0.0 {
+            return Err(Error::msg("config: frequency must be finite and positive"));
         }
-        if self.sample_rate < 250_000.0 {
+        if !self.sample_rate.is_finite() || self.sample_rate < 250_000.0 {
             return Err(Error::msg(
-                "config: sample_rate must be at least 250000 Hz (lower rates pin the waterfall bin width too high)",
+                "config: sample_rate must be finite and at least 250000 Hz (lower rates pin the waterfall bin width too high)",
             ));
+        }
+        if self.gain.is_some_and(|gain| !gain.is_finite()) {
+            return Err(Error::msg("config: gain must be finite"));
+        }
+        if !self.ppm.is_finite() {
+            return Err(Error::msg("config: ppm must be finite"));
         }
         if self.period_seconds < 5 {
             return Err(Error::msg("config: period_seconds must be at least 5"));
@@ -273,14 +279,22 @@ impl Config {
                 .beacon
                 .as_ref()
                 .ok_or_else(|| Error::msg("config: mode=beacon requires a `beacon:` block"))?;
-            if b.bandwidth_hz <= 0.0 {
+            if !b.offset_hz.is_finite() {
+                return Err(Error::msg("config: beacon.offset_hz must be finite"));
+            }
+            if !b.bandwidth_hz.is_finite() || b.bandwidth_hz <= 0.0 {
                 return Err(Error::msg(
-                    "config: beacon.bandwidth_hz must be positive",
+                    "config: beacon.bandwidth_hz must be finite and positive",
                 ));
             }
             if b.bandwidth_hz > self.sample_rate / 2.0 {
                 return Err(Error::msg(
                     "config: beacon.bandwidth_hz exceeds sample_rate/2",
+                ));
+            }
+            if b.offset_hz.abs() + b.bandwidth_hz / 2.0 > self.sample_rate / 2.0 {
+                return Err(Error::msg(
+                    "config: beacon passband extends outside the sampled spectrum",
                 ));
             }
         }
@@ -347,6 +361,27 @@ microwaveprop:
     #[test]
     fn rejects_zero_or_negative_frequency() {
         let yaml = "frequency: 0\nmode: cw\nsample_rate: 250000\n";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_numeric_values() {
+        for (field, value) in [
+            ("frequency", "NaN"),
+            ("sample_rate", "inf"),
+            ("gain", "NaN"),
+            ("ppm", "-inf"),
+        ] {
+            let yaml = format!(
+                "frequency: 28330000\nmode: cw\nsample_rate: 250000\n{field}: {value}\n"
+            );
+            assert!(Config::from_yaml_str(&yaml).is_err(), "accepted {field}: {value}");
+        }
+    }
+
+    #[test]
+    fn rejects_beacon_passband_extending_outside_sampled_spectrum() {
+        let yaml = "frequency: 28330000\nmode: beacon\nsample_rate: 250000\nbeacon:\n  offset_hz: 124900\n  bandwidth_hz: 300\n";
         assert!(Config::from_yaml_str(yaml).is_err());
     }
 

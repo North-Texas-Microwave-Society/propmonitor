@@ -46,8 +46,8 @@ pub struct UploaderStatus {
 pub(crate) enum ResponseClass {
     /// 2xx — measurement accepted.
     Ok,
-    /// 4xx — body or auth bad; never going to succeed without operator
-    /// intervention. Drop the head of the queue.
+    /// Non-429 4xx — body or auth bad; never going to succeed without
+    /// operator intervention. Drop the head of the queue.
     Permanent,
     /// 5xx, network error, timeout — try again after backoff.
     Transient,
@@ -58,6 +58,8 @@ pub(crate) enum ResponseClass {
 pub(crate) fn classify_status(status: reqwest::StatusCode) -> ResponseClass {
     if status.is_success() {
         ResponseClass::Ok
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        ResponseClass::Transient
     } else if status.is_client_error() {
         ResponseClass::Permanent
     } else {
@@ -209,9 +211,11 @@ pub async fn run(
                         )
                         .await;
                         if !transient {
-                            // Permanent failure (4xx) — drop the head so
-                            // we don't retry it forever.
+                            // Permanent failure (non-429 4xx) — drop the
+                            // head so we don't retry it forever.
                             queue.pop_front();
+                            backoff = Duration::from_secs(1);
+                            continue;
                         }
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(max_backoff);
@@ -274,7 +278,7 @@ pub async fn run(
 
 /// POST one measurement. Returns `Ok(())` on 2xx. Returns `Err(true)` for
 /// transient failures (5xx, timeout, network) — keep in queue. Returns
-/// `Err(false)` for permanent failures (4xx) — drop from queue.
+/// `Err(false)` for permanent failures (non-429 4xx) — drop from queue.
 async fn post_one(
     client: &reqwest::Client,
     endpoint: &str,
@@ -356,6 +360,10 @@ mod tests {
         assert_eq!(
             classify_status(StatusCode::BAD_REQUEST),
             ResponseClass::Permanent
+        );
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS),
+            ResponseClass::Transient
         );
         assert_eq!(
             classify_status(StatusCode::UNAUTHORIZED),

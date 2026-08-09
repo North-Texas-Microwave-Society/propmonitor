@@ -89,9 +89,9 @@ fn compute_bins(
     scratch: &mut [Complex32],
 ) -> Vec<f32> {
     let mut work: Vec<Complex32> = Vec::with_capacity(FFT_N);
-    for i in 0..FFT_N {
+    for (i, window) in hann.iter().enumerate().take(FFT_N) {
         let idx = (pos + i) % FFT_N;
-        work.push(ring[idx] * hann[i]);
+        work.push(ring[idx] * *window);
     }
     fft.process_with_scratch(&mut work, scratch);
     let mut bins = Vec::with_capacity(FFT_N);

@@ -115,7 +115,7 @@ and `src/uploader.rs::classify_status`):
 | `401 Unauthorized` | Bad / missing / revoked monitor token. | Log; drop measurement. Operator needs to update the token. |
 | `403 Forbidden` | `monitor_token` is valid but doesn't authorize reporting for the supplied `beacon_id`, or the beacon is not approved/on-the-air. | Log; drop measurement. |
 | `404 Not Found` | Unknown `beacon_id`. | Log; drop measurement. |
-| `429 Too Many Requests` | Rate limited. | Counts as a 4xx → dropped today (we'll iterate this if you want backoff support; the existing rate limiter at `lib/microwaveprop_web/api/rate_limiter.ex` should already bucket the bearer token). |
+| `429 Too Many Requests` | Rate limited. | Keep queued and retry with exponential backoff (1 s → 5 min cap). |
 | `5xx` | Server-side failure. | Enqueue; retry with exponential backoff (1 s → 5 min cap). |
 | network error / timeout | Unreachable. | Same as `5xx`. |
 
@@ -237,7 +237,7 @@ payload:
 - Auth + POST: `src/uploader.rs::post_one`
 - Retry loop: `src/uploader.rs::run`
 - Status classification: `src/uploader.rs::classify_status` (2xx →
-  accept, 4xx → drop, 5xx/network → retry)
+  accept, non-429 4xx → drop, 429/5xx/network → retry)
 - DSP that produces the signal stats: `src/measure.rs::SpectrumAnalyzer::finalize`
   (the gating + active-fraction calculation in particular)
 

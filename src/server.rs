@@ -321,10 +321,10 @@ fn build_yaml_from_update(
 ) -> Result<String, Error> {
     use crate::yaml::YamlWriter;
     let mut w = YamlWriter::new();
-    w.scalar("frequency", &format!("{}", body.frequency as i64));
+    w.scalar("frequency", &body.frequency.to_string());
     w.scalar("mode", &body.mode);
     w.string("driver", &body.driver);
-    w.scalar("sample_rate", &format!("{}", body.sample_rate as i64));
+    w.scalar("sample_rate", &body.sample_rate.to_string());
     if let Some(g) = body.gain {
         w.scalar("gain", &format!("{}", g));
     }
@@ -806,6 +806,17 @@ mod tests {
         assert_eq!(mw.monitor_token, "new-token");
         assert_eq!(mw.beacon_id, "uuid-xyz");
         assert!(mw.enabled);
+    }
+
+    #[test]
+    fn build_yaml_from_update_preserves_fractional_tuning_values() {
+        let mut body = sample_update();
+        body.frequency = 28_330_000.5;
+        body.sample_rate = 250_000.25;
+        let yaml = build_yaml_from_update(&body, "tok", 60).unwrap();
+        let parsed = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(parsed.frequency, 28_330_000.5);
+        assert_eq!(parsed.sample_rate, 250_000.25);
     }
 
     #[test]

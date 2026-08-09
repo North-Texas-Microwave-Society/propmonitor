@@ -62,9 +62,9 @@ pub fn compute_waterfall_bins(
     debug_assert_eq!(hann.len(), WATERFALL_FFT_N);
 
     let mut work: Vec<Complex32> = Vec::with_capacity(WATERFALL_FFT_N);
-    for i in 0..WATERFALL_FFT_N {
+    for (i, window) in hann.iter().enumerate() {
         let idx = (wf_pos + i) % WATERFALL_FFT_N;
-        work.push(wf_ring[idx] * hann[i]);
+        work.push(wf_ring[idx] * *window);
     }
     fft.process_with_scratch(&mut work, scratch);
     let mut bins: Vec<f32> = Vec::with_capacity(WATERFALL_FFT_N);

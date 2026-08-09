@@ -356,7 +356,7 @@ beacon:
     #[test]
     fn parse_f64_rejects_nonsense() {
         assert!(parse_f64("not-a-number", "x").is_err());
-        assert_eq!(parse_f64("3.14", "x").unwrap(), 3.14);
+        assert_eq!(parse_f64("1.25", "x").unwrap(), 1.25);
     }
 
     #[test]

@@ -422,7 +422,7 @@ included in the upload.
 | `204 No Content` | Accepted, recorded. Server should update the monitor's `last_seen_at`. | Mark measurement uploaded. |
 | `400 Bad Request` | Malformed body or unknown `beacon_id`. | Log, drop measurement (don't retry — schema mismatch won't fix itself). |
 | `401 Unauthorized` | Bad/missing/revoked monitor token. | Log, stop uploading until config is updated. |
-| `429 Too Many Requests` | Rate limited. | Back off per `Retry-After` if present, else exponential. |
+| `429 Too Many Requests` | Rate limited. | Enqueue and retry with exponential backoff (1 s → 5 min cap). |
 | `5xx` | Server-side failure. | Enqueue, retry with exponential backoff (1 s → 5 min cap). |
 | network error / timeout | Unreachable. | Same as `5xx`. |
 

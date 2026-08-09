@@ -102,7 +102,7 @@ fn make_antenna_icon() -> Icon {
 
     // Cross arm near the top.
     for x in 11..22 {
-        set(&mut rgba, x as i32, 9, fg);
+        set(&mut rgba, x, 9, fg);
     }
 
     // Three "signal" notches on each side of the mast, fanning up.
@@ -122,7 +122,7 @@ fn make_antenna_icon() -> Icon {
     }
     // Ground line.
     for x in 10..22 {
-        set(&mut rgba, x as i32, 30, fg);
+        set(&mut rgba, x, 30, fg);
     }
 
     Icon::from_rgba(rgba, W as u32, H as u32).expect("32x32 RGBA -> Icon")
