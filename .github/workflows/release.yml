@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            cross_image: ''
+            artifact: propmonitor-x86_64-linux
+            asset: propmonitor-x86_64-linux.tar.gz
+            apt_packages: libsoapysdr-dev
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            cross_image: propmonitor-cross-aarch64
+            dockerfile: docker/cross-aarch64.Dockerfile
+            artifact: propmonitor-aarch64-linux
+            asset: propmonitor-aarch64-linux.tar.gz
+            apt_strip: binutils-aarch64-linux-gnu
+            cross_strip: aarch64-linux-gnu-strip
+
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+            cross_image: propmonitor-cross-armv7
+            dockerfile: docker/cross-armv7.Dockerfile
+            artifact: propmonitor-armv7-linux
+            asset: propmonitor-armv7-linux.tar.gz
+            apt_strip: binutils-arm-linux-gnueabihf
+            cross_strip: arm-linux-gnueabihf-strip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native SoapySDR (x86_64)
+        if: ${{ !matrix.cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build cross Docker image
+        if: ${{ matrix.cross }}
+        run: docker build -t ${{ matrix.cross_image }} -f ${{ matrix.dockerfile }} docker/
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@latest
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Strip (native)
+        if: ${{ !matrix.cross }}
+        run: strip target/${{ matrix.target }}/release/propmonitor
+
+      - name: Strip (cross)
+        if: ${{ matrix.cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_strip }}
+          ${{ matrix.cross_strip }} target/${{ matrix.target }}/release/propmonitor
+
+      - name: Package
+        run: |
+          mkdir -p dist/propmonitor-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/propmonitor dist/propmonitor-${{ matrix.target }}/
+          cp target/${{ matrix.target }}/release/sdr_diag dist/propmonitor-${{ matrix.target }}/ 2>/dev/null || true
+          cp config.yaml dist/propmonitor-${{ matrix.target }}/ 2>/dev/null || true
+          tar czf ${{ matrix.asset }} -C dist propmonitor-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
