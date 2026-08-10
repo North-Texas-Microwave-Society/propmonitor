@@ -26,6 +26,20 @@ cargo fmt
 Runtime dependency: a working `SoapySDR` install plus the driver module
 for the dongle being used.
 
+## Releasing
+
+When pushing a release, bump the version tag:
+
+```bash
+cargo test && cargo build --release   # verify everything is green
+git tag -d v0.0.N  2>/dev/null; git tag v0.0.N && git push origin v0.0.N --force
+```
+
+The tag triggers the GitHub release workflow (`.github/workflows/release.yml`)
+which builds binaries for x86_64, aarch64, and armv7 and attaches them to
+a GitHub Release. The tagged commit should always be the tip of `main`
+and should pass `cargo test`.
+
 ## Architecture
 
 One process owns the SDR (single-instance). Inside the process:
