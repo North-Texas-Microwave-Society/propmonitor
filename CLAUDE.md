@@ -11,10 +11,6 @@ periodically uploads measurements to **microwaveprop** so beacon
 strength can be correlated with weather over time. The point is
 24/7 beacon monitoring, not interactive use.
 
-The binary opens a system-tray icon on startup and auto-launches the
-operator's browser at `http://127.0.0.1:8080`. The tray's only
-interactions are **Open in browser** and **Quit**.
-
 ## Commands
 
 ```bash
@@ -28,21 +24,16 @@ cargo fmt
 ```
 
 Runtime dependency: a working `SoapySDR` install plus the driver module
-for the dongle being used. On Linux, `libayatana-appindicator3` is also
-needed at runtime for the tray icon (the binary falls back to headless
-mode if it can't init the tray — the server still works).
+for the dongle being used.
 
 ## Architecture
 
 One process owns the SDR (single-instance). Inside the process:
 
-- **`src/main.rs`** — Boots the tokio runtime on a **worker thread**,
-  not the main thread. The OS tray event loop must own the main thread
-  on Windows and macOS, so tokio is `Box::leak`'d behind that.
-- **`src/tray.rs`** — Builds a tao `EventLoop` and a tray-icon with
-  hand-rendered 32×32 antenna RGBA (no PNG decoder dep). Falls back to
-  `thread::park()` if the OS doesn't support the tray (e.g. headless
-  Linux over SSH).
+- **`src/main.rs`** — Boots the tokio runtime on the main thread, sets
+  up shared state via `boot`, spawns the HTTP/WS server task, and then
+  blocks on Ctrl+C until shutdown. Fully headless — no tray, no
+  auto-browser.
 - **`src/worker.rs`** — Owns the SDR device. Sync `std::thread`, not
   async — SoapySDR is sync and blocking reads are simplest. Emits
   `WorkerEvent`s (`PeriodStarted`, `PeriodMeasurement`, `WaterfallRow`,
@@ -104,8 +95,8 @@ continuous carriers (FM/AM). Tests in `measure.rs` pin that contract.
   the gain is set. RTL-SDR's `TUNER` element gets the value; other
   drivers fall back to `set_gain`. If `cfg.gain` is `None`, AGC is on.
 - The HTTP `bind` field can be `0.0.0.0:port` for LAN access, but the
-  browser auto-opens to `127.0.0.1:port` — `browser_url_from_bind` in
-  `main.rs` does this substitution.
+  startup message prints the loopback URL (`http://127.0.0.1:port`) that
+  actually works in a browser — `main.rs` does this substitution.
 - The microwaveprop ingest endpoint **doesn't yet exist on the server
   side** — see `api.md` §4 for the wire contract this client targets.
 - Windows builds aren't in CI. See `windows_build.md`.

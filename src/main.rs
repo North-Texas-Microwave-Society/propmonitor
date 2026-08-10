@@ -4,14 +4,12 @@ mod measure;
 mod server;
 mod store;
 mod timefmt;
-mod tray;
 mod uploader;
 mod worker;
 mod yaml;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
 
 use tokio::sync::RwLock;
 
@@ -32,12 +30,7 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("failed to load config from {}", config_path))?;
     let bind = cfg.http.bind.clone();
-    let browser_url = browser_url_from_bind(&bind);
 
-    // Tokio runs on a worker thread because the OS tray on Windows and
-    // macOS *requires* the event loop on the process's main thread. The
-    // server, worker thread, bridge, and uploader all live inside this
-    // runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -58,46 +51,23 @@ fn main() -> Result<()> {
         });
     }
 
-    // Auto-open browser shortly after the server starts. A short delay
-    // is enough for axum to be listening on the port.
-    //
-    // Suppressed by `PROPMONITOR_NO_BROWSER=1` for headless deployments
-    // and for any future integration tests that boot the server without
-    // wanting to pop a real window. (Today's `cargo test` doesn't invoke
-    // `main`, so this gate is belt-and-braces.)
-    if std::env::var("PROPMONITOR_NO_BROWSER").is_err() {
-        let url = browser_url.clone();
-        rt.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Err(e) = webbrowser::open(&url) {
-                eprintln!("propmonitor: could not open browser: {}", e);
-            }
-        });
-    }
+    let port = bind
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(5760);
+    eprintln!(
+        "propmonitor: listening on http://127.0.0.1:{} (Ctrl+C to exit)",
+        port
+    );
 
-    // Keep the tokio runtime alive for the lifetime of the process. The
-    // tray event loop will own the main thread; when "Quit" is selected
-    // it calls process::exit which tears the runtime down with it.
-    //
-    // The runtime is moved into a `Box::leak`-style static so it isn't
-    // dropped at the end of main; otherwise `tray::run` would `loop {}`
-    // happily but the spawned tasks would be cancelled by Drop.
-    let _rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
+    // Block the main thread until Ctrl+C
+    rt.block_on(async {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("propmonitor: shutting down");
+    });
 
-    // Run the tray on the main thread. If the OS doesn't have a tray
-    // (headless Linux over SSH, missing libayatana-appindicator, etc.)
-    // fall back to a Ctrl+C-driven park so the server still runs.
-    match tray::run(browser_url) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!(
-                "propmonitor: tray unavailable ({}), running headless — Ctrl+C to exit",
-                e
-            );
-            std::thread::park();
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
@@ -140,17 +110,4 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
     }
 
     Ok(state)
-}
-
-/// Turn a config `http.bind` value into a URL the user's browser can
-/// actually reach. `0.0.0.0` and `::` mean "listen on all interfaces"
-/// to the OS, but browsers can't connect to those — they need a real
-/// loopback or hostname.
-fn browser_url_from_bind(bind: &str) -> String {
-    let port = bind
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(5760);
-    format!("http://127.0.0.1:{}", port)
 }

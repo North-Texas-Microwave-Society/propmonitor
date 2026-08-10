@@ -97,7 +97,6 @@ fi
 PACKAGES=(
     libsoapysdr0.8
     soapysdr-module-rtlsdr
-    libayatana-appindicator3-1
     curl
 )
 
@@ -286,10 +285,6 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=propmonitor
-
-# Allow the process to open the tray icon (falls back to headless if
-# no display is available — the HTTP server still works).
-Environment=DISPLAY=:0
 
 # Basic hardening (SDR needs USB access, so we keep it light)
 NoNewPrivileges=yes

@@ -7,7 +7,7 @@ over a configurable integration window, and uploads the measurements to
 correlated with weather over time.
 
 Includes a live web UI (waterfall, dBFS readout, settings form) on
-`http://127.0.0.1:5760` and a system-tray icon.
+`http://127.0.0.1:5760`.
 
 ## Quick install (Debian 13 / Raspberry Pi OS)
 
@@ -36,8 +36,6 @@ If you prefer to build from source or need to run on macOS/Windows:
 - [SoapySDR](https://github.com/pothosware/SoapySDR) + the driver module
   for your dongle (`soapysdr-module-rtlsdr`, `soapysdr-module-sdrplay`,
   etc.)
-- For Linux: `libayatana-appindicator3-dev` (for the tray icon); at
-  runtime only `libayatana-appindicator3-1` is needed.
 
 ### macOS
 
@@ -48,7 +46,7 @@ brew install soapysdr soapyrtlsdr
 ### Debian/Ubuntu Linux
 
 ```bash
-sudo apt install libsoapysdr-dev soapysdr-module-rtlsdr libayatana-appindicator3-dev librtlsdr-dev
+sudo apt install libsoapysdr-dev soapysdr-module-rtlsdr librtlsdr-dev
 ```
 
 ### Windows
@@ -63,7 +61,7 @@ cargo build --release
 ./target/release/propmonitor my-config.yaml
 ```
 
-The tray icon should appear, and your browser should open to
+Open your browser to
 `http://127.0.0.1:5760`. The web UI exposes everything: live waterfall,
 signal/noise readout, full settings form (changes are persisted to
 `config.yaml` and apply immediately via worker restart).
