@@ -3,20 +3,41 @@
 Headless beacon-signal-level monitor. Tunes an SDR (RTL-SDR, SDRplay,
 anything SoapySDR can drive), measures noise floor + signal level + SNR
 over a configurable integration window, and uploads the measurements to
-[microwaveprop](https://git.mcintire.me/grahammc/microwaveprop) so beacon
-strength can be correlated with weather over time.
+[microwaveprop](https://prop.w5isp.com) so beacon strength can be
+correlated with weather over time.
 
 Includes a live web UI (waterfall, dBFS readout, settings form) on
-`http://127.0.0.1:5760` and a system-tray icon. On startup it auto-opens
-your default browser.
+`http://127.0.0.1:5760` and a system-tray icon.
 
-## Requirements
+## Quick install (Debian 13 / Raspberry Pi OS)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/graham/propmonitor/main/install.sh | sudo bash
+```
+
+This single command installs everything: system dependencies, the latest
+binary release, a systemd service, and walks you through initial
+configuration. After it finishes:
+
+- **Web UI:** `http://<your-pi-ip>:5760`
+- **Logs:** `sudo journalctl -u propmonitor -f`
+- **Edit config:** `sudo nano /etc/propmonitor/config.yaml`
+- **Restart:** `sudo systemctl restart propmonitor`
+
+The installer is safe to re-run — it won't overwrite your `config.yaml`.
+
+## Build from source
+
+If you prefer to build from source or need to run on macOS/Windows:
+
+### Requirements
 
 - Rust stable
 - [SoapySDR](https://github.com/pothosware/SoapySDR) + the driver module
   for your dongle (`soapysdr-module-rtlsdr`, `soapysdr-module-sdrplay`,
   etc.)
-- For Linux: `libayatana-appindicator3-dev` (for the tray icon)
+- For Linux: `libayatana-appindicator3-dev` (for the tray icon); at
+  runtime only `libayatana-appindicator3-1` is needed.
 
 ### macOS
 
@@ -72,8 +93,9 @@ http:
 # The ingest URL is hardcoded in src/uploader.rs (MICROWAVEPROP_ENDPOINT).
 # microwaveprop:
 #   enabled: true
-#   monitor_token: "…"
-#   beacon_callsign: "W1XYZ"
+#   gridsquare: "FN31pr"         # REQUIRED — Maidenhead grid square of receiver
+#   monitor_token: "…"           # from https://prop.w5isp.com setup page
+#   beacon_id: "…"               # UUID of the beacon being monitored
 ```
 
 See [`api.md`](./api.md) for the full REST/WebSocket/upload contract.
