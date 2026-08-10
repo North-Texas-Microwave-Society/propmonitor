@@ -62,13 +62,18 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Value>> {
             0 => {
                 // Closing the previous child block, if any.
                 if let Some((k, m)) = open_child.take() {
-                    top.insert(k, Value::Map(m));
+                    insert_unique(&mut top, k, Value::Map(m), line_no)?;
                 }
                 let (key, value) = split_kv(content, line_no)?;
                 if value.is_empty() {
                     open_child = Some((key, BTreeMap::new()));
                 } else {
-                    top.insert(key, Value::Scalar(unquote(value)));
+                    insert_unique(
+                        &mut top,
+                        key,
+                        Value::Scalar(unquote(value, line_no)?),
+                        line_no,
+                    )?;
                 }
             }
             2 => {
@@ -85,7 +90,12 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Value>> {
                         line_no
                     )));
                 }
-                child.1.insert(key, Value::Scalar(unquote(value)));
+                insert_unique(
+                    &mut child.1,
+                    key,
+                    Value::Scalar(unquote(value, line_no)?),
+                    line_no,
+                )?;
             }
             n => {
                 return Err(Error::msg(format!(
@@ -96,7 +106,9 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Value>> {
         }
     }
     if let Some((k, m)) = open_child.take() {
-        top.insert(k, Value::Map(m));
+        // `text.lines().count() + 1` points just past the document and
+        // gives duplicate-parent errors a useful location.
+        insert_unique(&mut top, k, Value::Map(m), text.lines().count() + 1)?;
     }
     Ok(top)
 }
@@ -105,8 +117,13 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Value>> {
 /// that `key: "string with # inside"` parses correctly.
 fn strip_comment(line: &str) -> &str {
     let mut in_quotes = false;
+    let mut escaped = false;
     for (i, c) in line.char_indices() {
-        if c == '"' {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && in_quotes {
+            escaped = true;
+        } else if c == '"' {
             in_quotes = !in_quotes;
         } else if c == '#' && !in_quotes {
             return &line[..i];
@@ -130,12 +147,59 @@ fn split_kv(s: &str, line_no: usize) -> Result<(String, &str)> {
     Ok((key, value))
 }
 
-fn unquote(s: &str) -> String {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+fn unquote(s: &str, line_no: usize) -> Result<String> {
+    if !s.starts_with('"') {
+        return Ok(s.to_string());
     }
+
+    if s.len() < 2 || !s.ends_with('"') {
+        return Err(Error::msg(format!(
+            "yaml line {}: unterminated quoted string",
+            line_no
+        )));
+    }
+
+    let mut out = String::new();
+    let mut chars = s[1..s.len() - 1].chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                return Err(Error::msg(format!(
+                    "yaml line {}: unsupported escape \\{}",
+                    line_no, other
+                )));
+            }
+            None => {
+                return Err(Error::msg(format!(
+                    "yaml line {}: trailing backslash in quoted string",
+                    line_no
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn insert_unique(
+    map: &mut BTreeMap<String, Value>,
+    key: String,
+    value: Value,
+    line_no: usize,
+) -> Result<()> {
+    if map.contains_key(&key) {
+        return Err(Error::msg(format!(
+            "yaml line {}: duplicate key {:?}",
+            line_no, key
+        )));
+    }
+    map.insert(key, value);
+    Ok(())
 }
 
 // ---------------- typed accessors -------------------------------------
@@ -304,6 +368,30 @@ beacon:
             m.get("note").unwrap().as_scalar(),
             Some("a # not a comment")
         );
+    }
+
+    #[test]
+    fn quoted_strings_round_trip_escaped_quotes_and_backslashes() {
+        let mut writer = YamlWriter::new();
+        writer.string("value", "driver=foo\\bar, label=\"test #1\"");
+        let parsed = parse(&writer.finish()).unwrap();
+        assert_eq!(
+            parsed.get("value").unwrap().as_scalar(),
+            Some("driver=foo\\bar, label=\"test #1\"")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_quoted_strings() {
+        assert!(parse("value: \"unterminated\n").is_err());
+        assert!(parse("value: \"bad\\n escape\"\n").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_keys() {
+        assert!(parse("mode: cw\nmode: beacon\n").is_err());
+        assert!(parse("beacon:\n  offset_hz: 0\n  offset_hz: 1\n").is_err());
+        assert!(parse("beacon:\n  offset_hz: 0\nbeacon:\n  offset_hz: 1\n").is_err());
     }
 
     #[test]

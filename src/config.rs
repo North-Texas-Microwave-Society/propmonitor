@@ -155,11 +155,12 @@ impl Config {
         };
 
         let period_seconds = match map.get("period_seconds") {
-            Some(v) => yaml::parse_usize(
+            Some(v) => u32::try_from(yaml::parse_usize(
                 v.as_scalar()
                     .ok_or_else(|| Error::msg("config: `period_seconds` must be a scalar"))?,
                 "period_seconds",
-            )? as u32,
+            )?)
+            .map_err(|_| Error::msg("config: `period_seconds` is too large"))?,
             None => 60,
         };
 
@@ -221,8 +222,16 @@ impl Config {
                 // already a signal of intent to report; the operator can
                 // explicitly set `enabled: false` to pause without
                 // erasing their credentials.
-                let enabled = match m.get("enabled").and_then(|v| v.as_scalar()) {
-                    Some(s) => s.parse::<bool>().unwrap_or(true),
+                let enabled = match m.get("enabled") {
+                    Some(v) => v
+                        .as_scalar()
+                        .ok_or_else(|| {
+                            Error::msg("config: `microwaveprop.enabled` must be a scalar")
+                        })?
+                        .parse::<bool>()
+                        .map_err(|_| {
+                            Error::msg("config: `microwaveprop.enabled` must be true or false")
+                        })?,
                     None => true,
                 };
                 let monitor_token = m
@@ -417,6 +426,18 @@ mode: cw
 sample_rate: 250000
 period_seconds: 1
 ";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_period_seconds_that_overflows_u32() {
+        let yaml = "frequency: 28330000\nmode: cw\nperiod_seconds: 4294967300\n";
+        assert!(Config::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_uploader_enabled_value() {
+        let yaml = "frequency: 28330000\nmode: cw\nmicrowaveprop:\n  enabled: maybe\n";
         assert!(Config::from_yaml_str(yaml).is_err());
     }
 
