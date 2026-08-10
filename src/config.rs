@@ -83,6 +83,11 @@ pub struct MicrowavepropConfig {
     /// microwaveprop side — replaces callsign-based identification so
     /// duplicate or unregistered callsigns can't confuse routing.
     pub beacon_id: String,
+    /// Maidenhead grid square of the RECEIVER location. Required for
+    /// uploads — the server uses it to correlate signal strength with
+    /// propagation paths. Up to 20 characters. Leave empty to disable
+    /// uploads.
+    pub gridsquare: String,
 }
 
 #[derive(Debug, Clone)]
@@ -230,10 +235,16 @@ impl Config {
                     .and_then(|v| v.as_scalar())
                     .unwrap_or("")
                     .to_string();
+                let gridsquare = m
+                    .get("gridsquare")
+                    .and_then(|v| v.as_scalar())
+                    .unwrap_or("")
+                    .to_string();
                 Some(MicrowavepropConfig {
                     enabled,
                     monitor_token,
                     beacon_id,
+                    gridsquare,
                 })
             }
             None => None,
@@ -295,6 +306,13 @@ impl Config {
             if b.offset_hz.abs() + b.bandwidth_hz / 2.0 > self.sample_rate / 2.0 {
                 return Err(Error::msg(
                     "config: beacon passband extends outside the sampled spectrum",
+                ));
+            }
+        }
+        if let Some(mw) = &self.microwaveprop {
+            if !mw.gridsquare.is_empty() && (mw.gridsquare.len() < 4 || mw.gridsquare.len() > 20) {
+                return Err(Error::msg(
+                    "config: microwaveprop.gridsquare must be 4–20 characters",
                 ));
             }
         }
@@ -607,10 +625,65 @@ microwaveprop:
   enabled: false
   monitor_token: \"token123\"
   beacon_id: \"00000000-0000-0000-0000-000000000001\"
+  gridsquare: \"FN31pr\"
 ";
         let cfg = Config::from_yaml_str(yaml).unwrap();
         let mw = cfg.microwaveprop.unwrap();
         assert!(!mw.enabled);
         assert_eq!(mw.monitor_token, "token123");
+        assert_eq!(mw.gridsquare, "FN31pr");
+    }
+
+    #[test]
+    fn gridsquare_parses_and_defaults() {
+        // Present → parsed.
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+microwaveprop:
+  monitor_token: \"token123\"
+  beacon_id: \"00000000-0000-0000-0000-000000000001\"
+  gridsquare: \"EM12il\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.microwaveprop.unwrap().gridsquare, "EM12il");
+
+        // Omitted → defaults to empty string.
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+microwaveprop:
+  monitor_token: \"token123\"
+  beacon_id: \"00000000-0000-0000-0000-000000000001\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.microwaveprop.unwrap().gridsquare, "");
+    }
+
+    #[test]
+    fn gridsquare_validation_rejects_bad_lengths() {
+        // Empty gridsquare is allowed (pauses uploads), 4–20 is allowed.
+        for gs in ["", "EM12", "EM12il", "EM12ilABCDEFGHIJKL"] {
+            let yaml = format!(
+                "frequency: 28330000\nmode: cw\nsample_rate: 250000\nmicrowaveprop:\n  monitor_token: \"t\"\n  beacon_id: \"b\"\n  gridsquare: \"{gs}\"\n"
+            );
+            assert!(
+                Config::from_yaml_str(&yaml).is_ok(),
+                "rejected valid gridsquare {gs:?}"
+            );
+        }
+
+        // Too short (< 4) and too long (> 20) → rejected.
+        for gs in ["EM1", "EM12ilABCDEFGHIJKLMNOP"] {
+            let yaml = format!(
+                "frequency: 28330000\nmode: cw\nsample_rate: 250000\nmicrowaveprop:\n  monitor_token: \"t\"\n  beacon_id: \"b\"\n  gridsquare: \"{gs}\"\n"
+            );
+            assert!(
+                Config::from_yaml_str(&yaml).is_err(),
+                "accepted invalid gridsquare {gs:?}"
+            );
+        }
     }
 }

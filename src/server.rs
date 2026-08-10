@@ -195,6 +195,7 @@ struct MicrowavepropView {
     enabled: bool,
     monitor_token: String, // always "redacted" on output
     beacon_id: String,
+    gridsquare: String,
 }
 
 fn cfg_to_view(cfg: &Config) -> ConfigView {
@@ -217,6 +218,7 @@ fn cfg_to_view(cfg: &Config) -> ConfigView {
             enabled: m.enabled,
             monitor_token: "redacted".to_string(),
             beacon_id: m.beacon_id.clone(),
+            gridsquare: m.gridsquare.clone(),
         }),
     }
 }
@@ -257,6 +259,8 @@ struct MicrowavepropUpdate {
     enabled: bool,
     monitor_token: String,
     beacon_id: String,
+    #[serde(default)]
+    gridsquare: String,
 }
 
 fn default_true() -> bool {
@@ -358,6 +362,7 @@ fn build_yaml_from_update(
         w.nested_scalar("enabled", if m.enabled { "true" } else { "false" });
         w.nested_string("monitor_token", &token);
         w.nested_string("beacon_id", &m.beacon_id);
+        w.nested_string("gridsquare", &m.gridsquare);
     }
 
     Ok(w.finish())
@@ -721,6 +726,7 @@ mod tests {
                 enabled: true,
                 monitor_token: "secret-token".to_string(),
                 beacon_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                gridsquare: "EM12il".to_string(),
             }),
         }
     }
@@ -736,6 +742,7 @@ mod tests {
         let mw = v.microwaveprop.unwrap();
         assert_eq!(mw.monitor_token, "redacted");
         assert_eq!(mw.beacon_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(mw.gridsquare, "EM12il");
         assert!(mw.enabled);
         let b = v.beacon.unwrap();
         assert_eq!(b.bandwidth_hz, 300.0);
@@ -790,6 +797,7 @@ mod tests {
                 enabled: true,
                 monitor_token: "new-token".to_string(),
                 beacon_id: "uuid-xyz".to_string(),
+                gridsquare: "EM12il".to_string(),
             }),
         }
     }
@@ -805,6 +813,7 @@ mod tests {
         let mw = parsed.microwaveprop.unwrap();
         assert_eq!(mw.monitor_token, "new-token");
         assert_eq!(mw.beacon_id, "uuid-xyz");
+        assert_eq!(mw.gridsquare, "EM12il");
         assert!(mw.enabled);
     }
 
@@ -1129,6 +1138,7 @@ mod tests {
             v["microwaveprop"]["beacon_id"],
             "00000000-0000-0000-0000-000000000001"
         );
+        assert_eq!(v["microwaveprop"]["gridsquare"], "EM12il");
     }
 
     #[tokio::test]

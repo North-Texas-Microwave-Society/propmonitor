@@ -322,7 +322,7 @@ Validation rules:
 - `gain` either a number or omitted.
 - `period_seconds` >= 5.
 - `beacon.bandwidth_hz` > 0 and <= `sample_rate / 2`.
-- `microwaveprop.enabled` must be `true` AND `monitor_token` must be non-empty AND `beacon_id` must be non-empty for uploads to actually run. Any of these conditions false → uploads paused.
+- `microwaveprop.enabled` must be `true` AND `monitor_token` must be non-empty AND `beacon_id` must be non-empty AND `gridsquare` must be non-empty for uploads to actually run. Any of these conditions false → uploads paused.
 
 The in-tree YAML parser (`src/yaml.rs`) supports the subset used here:
 scalars (numbers, quoted/unquoted strings, comments) and one level of nesting
@@ -359,6 +359,7 @@ already used for the rest of the v1 API
 ```json
 {
   "beacon_id":              "00000000-0000-0000-0000-000000000000",
+  "gridsquare":             "FN31pr",
   "frequency_hz":           28330000,
   "measured_at":            "2026-05-13T15:30:00Z",
   "integration_s":          60,
@@ -379,6 +380,7 @@ Field semantics:
 | Field | Type | Notes |
 |---|---|---|
 | `beacon_id` | string (UUID) | Identifies *which* beacon this measurement is for. Canonical key on the microwaveprop side. The same monitor_token can only legitimately report for the beacon its record is associated with; mismatches are server policy. |
+| `gridsquare` | string | Maidenhead grid square of the RECEIVER station (e.g. `"FN31pr"`). 4–20 characters. Required for the server to correlate signal strength with propagation-path distance and bearing. |
 | `frequency_hz` | integer | The propmonitor *tuned* frequency in Hz. Not the beacon's nominal frequency; the operator may intentionally tune slightly off to compensate for radio offset. |
 | `measured_at` | string | UTC ISO-8601 timestamp at the **start** of the integration window. |
 | `integration_s` | number | The measurement window length in seconds. Equal to `period_seconds` in propmonitor config. |

@@ -70,7 +70,7 @@ pub(crate) fn classify_status(status: reqwest::StatusCode) -> ResponseClass {
 /// Whether the configured microwaveprop block is fully populated enough
 /// to attempt uploads. Used both at queue-drain time and at enqueue time.
 pub(crate) fn should_upload(mw: &crate::config::MicrowavepropConfig) -> bool {
-    mw.enabled && !mw.monitor_token.is_empty() && !mw.beacon_id.is_empty()
+    mw.enabled && !mw.monitor_token.is_empty() && !mw.beacon_id.is_empty() && !mw.gridsquare.is_empty()
 }
 
 /// Pick the gain value to stamp onto an upload. Prefers the SDR's
@@ -89,6 +89,10 @@ pub(crate) struct WireMeasurement {
     /// UUID of the beacon being monitored. Canonical key on the
     /// microwaveprop side.
     pub(crate) beacon_id: String,
+    /// Maidenhead grid square of the receiver station. Used by the
+    /// server to correlate signal level with propagation-path distance
+    /// and bearing.
+    pub(crate) gridsquare: String,
     pub(crate) frequency_hz: u64,
     pub(crate) measured_at: String,
     pub(crate) integration_s: u32,
@@ -130,6 +134,7 @@ pub(crate) fn build_wire_measurement(
 ) -> WireMeasurement {
     WireMeasurement {
         beacon_id: mw.beacon_id.clone(),
+        gridsquare: mw.gridsquare.clone(),
         frequency_hz: cfg.frequency as u64,
         measured_at,
         integration_s: cfg.period_seconds,
@@ -350,6 +355,7 @@ mod tests {
             enabled: true,
             monitor_token: "token-123".to_string(),
             beacon_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            gridsquare: "EM12il".to_string(),
         }
     }
 
@@ -386,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn should_upload_requires_all_three_fields() {
+    fn should_upload_requires_all_fields() {
         let full = sample_mw();
         assert!(should_upload(&full));
 
@@ -404,9 +410,15 @@ mod tests {
 
         let no_beacon = MicrowavepropConfig {
             beacon_id: String::new(),
-            ..full
+            ..full.clone()
         };
         assert!(!should_upload(&no_beacon));
+
+        let no_gridsquare = MicrowavepropConfig {
+            gridsquare: String::new(),
+            ..full
+        };
+        assert!(!should_upload(&no_gridsquare));
     }
 
     #[test]
@@ -450,6 +462,7 @@ mod tests {
             0.48,
         );
         assert_eq!(m.beacon_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(m.gridsquare, "EM12il");
         assert_eq!(m.frequency_hz, 28_330_000);
         assert_eq!(m.measured_at, "2026-05-13T15:30:00Z");
         assert_eq!(m.integration_s, 60);
@@ -485,6 +498,7 @@ mod tests {
         let obj = v.as_object().unwrap();
         for key in [
             "beacon_id",
+            "gridsquare",
             "frequency_hz",
             "measured_at",
             "integration_s",

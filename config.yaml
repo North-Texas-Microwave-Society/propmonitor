@@ -16,5 +16,6 @@ http:
 
 # microwaveprop:
 #   enabled: true
+#   gridsquare: ""               # Maidenhead grid square of receiver (e.g. "FN31pr")
 #   monitor_token: "your-monitor-token-here"
 #   beacon_id: "your-beacon-uuid-here"
