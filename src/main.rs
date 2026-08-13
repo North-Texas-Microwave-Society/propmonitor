@@ -90,7 +90,10 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
 
     {
         let handle = spawn_worker_and_bridge(state.clone(), cfg.clone());
-        *state.worker_handle.lock().unwrap() = Some(handle);
+        *state
+            .worker_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
     }
 
     {

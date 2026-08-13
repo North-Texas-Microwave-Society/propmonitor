@@ -187,8 +187,7 @@ pub async fn run(
                     .filter(|m| should_upload(m))
                     .map(|m| m.monitor_token.clone())
             };
-            if let Some(token) = token {
-                let m = queue.front().unwrap().clone();
+            if let (Some(token), Some(m)) = (token, queue.front().cloned()) {
                 match post_one(&client, MICROWAVEPROP_ENDPOINT, &token, &m).await {
                     Ok(()) => {
                         queue.pop_front();

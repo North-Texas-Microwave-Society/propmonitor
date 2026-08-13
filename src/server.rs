@@ -306,7 +306,10 @@ async fn put_config(
         *current = new_cfg.clone();
     }
     {
-        let mut handle = state.worker_handle.lock().unwrap();
+        let mut handle = state
+            .worker_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(mut h) = handle.take() {
             h.stop_and_join();
         }
