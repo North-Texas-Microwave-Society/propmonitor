@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use crate::config::Config;
 use crate::error::{Context, Error, Result};
 use crate::server::{
-    forward_upload_events, new_broadcaster, spawn_worker_and_bridge, AppState,
+    forward_upload_events, new_broadcaster, restart_server, spawn_worker_and_bridge, AppState,
 };
 use crate::store::MeasurementStore;
 use crate::uploader::{new_event_channel, UploaderStatus};
@@ -40,15 +40,11 @@ fn main() -> Result<()> {
     // runtime handle directly available.
     let state = rt.block_on(async { boot(cfg, config_path).await })?;
 
-    {
-        let state = state.clone();
-        let bind = bind.clone();
-        rt.spawn(async move {
-            if let Err(e) = server::run(state, &bind).await {
-                eprintln!("propmonitor: server exited: {}", e);
-                std::process::exit(1);
-            }
-        });
+    // Start the HTTP server. Later `http.bind` changes are applied by
+    // PUT /api/config, which calls `restart_server` again.
+    if let Err(e) = rt.block_on(restart_server(&state, &bind)) {
+        eprintln!("propmonitor: server failed to start: {}", e);
+        std::process::exit(1);
     }
 
     let port = bind
@@ -86,6 +82,7 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
         device_info: device_info_arc.clone(),
         uploader_status: uploader_status_arc.clone(),
         worker_handle: StdMutex::new(None),
+        http_server: StdMutex::new(None),
     });
 
     {

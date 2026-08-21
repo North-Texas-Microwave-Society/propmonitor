@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Notify, RwLock};
 
 use crate::config::Config;
 use crate::error::Error;
@@ -87,6 +87,9 @@ pub struct AppState {
     pub uploader_status: Arc<RwLock<UploaderStatus>>,
     /// Handle to the running worker thread. Replaced on PUT /api/config.
     pub worker_handle: StdMutex<Option<WorkerHandle>>,
+    /// Handle to the running HTTP server. Replaced on `http.bind` change so
+    /// the listener can be rebound without restarting the process.
+    pub http_server: StdMutex<Option<ServerHandle>>,
 }
 
 pub struct WorkerHandle {
@@ -120,19 +123,74 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-pub async fn run(state: Arc<AppState>, bind: &str) -> Result<(), Error> {
+/// Handle to the running HTTP server task.
+pub struct ServerHandle {
+    shutdown: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// (Re)bind the HTTP listener to `bind`. The new address is bound eagerly so
+/// bind errors surface to the caller without disturbing the running server;
+/// on success the old server is signalled to stop (and reaped off-thread) and
+/// the new one starts serving. On failure the running server is left
+/// untouched.
+///
+/// The old server is never awaited here: `put_config` runs *inside* the
+/// server it is rebinding, and awaiting that server's graceful shutdown from
+/// within a request it is serving would deadlock (the shutdown waits for the
+/// in-flight request to finish). Instead we signal it and let a background
+/// task reap it once its connections drain.
+pub async fn restart_server(state: &Arc<AppState>, bind: &str) -> Result<(), Error> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| Error::msg(format!("invalid http.bind {:?}: {}", bind, e)))?;
+
+    // Bind first — if the new address is taken (including by our own running
+    // server on an overlapping address, e.g. 0.0.0.0:5760 → 127.0.0.1:5760),
+    // fail cleanly without tearing anything down.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| Error::msg(format!("bind {}: {}", addr, e)))?;
-    eprintln!("propmonitor: listening on http://{}", addr);
-    let app = build_router(state);
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| Error::msg(format!("axum::serve: {}", e)))?;
+
+    if let Some(old) = take_server(state) {
+        old.shutdown.notify_one();
+        tokio::spawn(async move {
+            let _ = old.task.await;
+        });
+    }
+
+    spawn_server(state, addr, listener);
     Ok(())
+}
+
+fn take_server(state: &Arc<AppState>) -> Option<ServerHandle> {
+    state
+        .http_server
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+fn spawn_server(state: &Arc<AppState>, addr: SocketAddr, listener: tokio::net::TcpListener) {
+    eprintln!("propmonitor: listening on http://{}", addr);
+    let app = build_router(state.clone());
+    let shutdown = Arc::new(Notify::new());
+    let shutdown2 = shutdown.clone();
+    let task = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown2.notified().await;
+            })
+            .await
+        {
+            eprintln!("propmonitor: server exited: {}", e);
+        }
+    });
+    let mut guard = state
+        .http_server
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(ServerHandle { shutdown, task });
 }
 
 async fn index_html() -> Response {
@@ -275,14 +333,14 @@ async fn put_config(
     //   - monitor_token: "redacted" sentinel preserves the existing one.
     //   - period_seconds: not in the UI form, so missing-on-PUT means
     //     "keep the existing value", not "reset to default".
-    let (preserved_token, preserved_period) = {
+    let (preserved_token, preserved_period, old_bind) = {
         let cfg = state.config.read().await;
         let token = cfg
             .microwaveprop
             .as_ref()
             .map(|m| m.monitor_token.clone())
             .unwrap_or_default();
-        (token, cfg.period_seconds)
+        (token, cfg.period_seconds, cfg.http.bind.clone())
     };
 
     let yaml = match build_yaml_from_update(&body, &preserved_token, preserved_period) {
@@ -294,6 +352,16 @@ async fn put_config(
         Ok(c) => c,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()),
     };
+
+    // If the bind address changed, rebind the HTTP listener *before*
+    // persisting so a bad bind fails cleanly and leaves config on disk
+    // untouched. `restart_server` never awaits the old server from inside
+    // this request (see its doc comment).
+    if new_cfg.http.bind != old_bind {
+        if let Err(e) = restart_server(&state, &new_cfg.http.bind).await {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
 
     // Persist atomically.
     if let Err(e) = crate::yaml::write_atomic(&state.config_path, &yaml) {
@@ -644,14 +712,33 @@ pub(crate) fn convert_worker_event(ev: &WorkerEvent, now_iso: &str) -> BridgeSte
     }
 }
 
+/// Choose the timestamp to stamp an event with. `PeriodStarted` records the
+/// current time as the start of a new integration window; the following
+/// `PeriodMeasurement` reuses that recorded start so `measured_at` reflects
+/// the beginning of the window, not its end (matching api.md §4).
+fn stamp_event(ev: &WorkerEvent, now: &str, period_start: &mut Option<String>) -> String {
+    match ev {
+        WorkerEvent::PeriodStarted => {
+            *period_start = Some(now.to_string());
+            now.to_string()
+        }
+        WorkerEvent::PeriodMeasurement(_) => {
+            period_start.clone().unwrap_or_else(|| now.to_string())
+        }
+        _ => now.to_string(),
+    }
+}
+
 fn bridge_loop(
     state: Arc<AppState>,
     rx: std::sync::mpsc::Receiver<WorkerEvent>,
     rt: tokio::runtime::Handle,
 ) {
+    let mut period_start: Option<String> = None;
     while let Ok(ev) = rx.recv() {
         let now = crate::timefmt::format_utc_iso8601(crate::timefmt::unix_now_secs());
-        let step = convert_worker_event(&ev, &now);
+        let stamp = stamp_event(&ev, &now, &mut period_start);
+        let step = convert_worker_event(&ev, &stamp);
 
         if step.update_device_info {
             let v = step.ws_event.clone();
@@ -966,6 +1053,25 @@ mod tests {
     }
 
     #[test]
+    fn measurement_carries_period_start_timestamp() {
+        let mut period_start: Option<String> = None;
+        // A period begins at T1.
+        assert_eq!(
+            stamp_event(&WorkerEvent::PeriodStarted, "T1", &mut period_start),
+            "T1"
+        );
+        // The measurement closing that period is stamped with T1 (window
+        // start), even though the bridge clock has since advanced to T2.
+        let ev = WorkerEvent::PeriodMeasurement(measurement(1.0));
+        assert_eq!(stamp_event(&ev, "T2", &mut period_start), "T1");
+        // Unrelated events carry the current clock, not the stale start.
+        assert_eq!(
+            stamp_event(&WorkerEvent::RawLevel { dbfs: -34.0 }, "T2", &mut period_start),
+            "T2"
+        );
+    }
+
+    #[test]
     fn convert_worker_event_measurement_pushes_to_store_and_carries_fraction() {
         let ev = WorkerEvent::PeriodMeasurement(measurement(0.48));
         let step = convert_worker_event(&ev, "2026-05-13T15:30:00Z");
@@ -1052,6 +1158,7 @@ mod tests {
             device_info: Arc::new(RwLock::new(None)),
             uploader_status: Arc::new(RwLock::new(UploaderStatus::default())),
             worker_handle: StdMutex::new(None),
+            http_server: StdMutex::new(None),
         })
     }
 
