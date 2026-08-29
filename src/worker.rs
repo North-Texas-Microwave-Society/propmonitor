@@ -40,8 +40,7 @@ pub const WATERFALL_FFT_N: usize = 1024;
 pub fn waterfall_hann_window() -> Vec<f32> {
     (0..WATERFALL_FFT_N)
         .map(|i| {
-            let phase =
-                2.0 * std::f32::consts::PI * i as f32 / (WATERFALL_FFT_N - 1) as f32;
+            let phase = 2.0 * std::f32::consts::PI * i as f32 / (WATERFALL_FFT_N - 1) as f32;
             0.5 - 0.5 * phase.cos()
         })
         .collect()
@@ -200,8 +199,7 @@ fn run_inner(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> 
     let mut wf_filled: usize = 0;
     let mut wf_since_emit: usize = 0;
     let wf_emit_every: usize = (actual_sample_rate / 10.0) as usize;
-    let mut fft_scratch =
-        vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+    let mut fft_scratch = vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
     let hann = waterfall_hann_window();
     let bin_hz = (actual_sample_rate / WATERFALL_FFT_N as f64) as f32;
     let f0_hz = -((actual_sample_rate as f32) / 2.0);
@@ -257,13 +255,8 @@ fn run_inner(cfg: &Config, tx: &Sender<WorkerEvent>, stop: &Arc<AtomicBool>) -> 
                 wf_since_emit += 1;
                 if wf_since_emit >= wf_emit_every && wf_filled >= WATERFALL_FFT_N {
                     wf_since_emit = 0;
-                    let bins = compute_waterfall_bins(
-                        &wf_ring,
-                        wf_pos,
-                        &hann,
-                        &*fft,
-                        &mut fft_scratch,
-                    );
+                    let bins =
+                        compute_waterfall_bins(&wf_ring, wf_pos, &hann, &*fft, &mut fft_scratch);
                     if tx
                         .send(WorkerEvent::WaterfallRow {
                             bins,
@@ -311,8 +304,7 @@ mod tests {
         let hann = waterfall_hann_window();
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(WATERFALL_FFT_N);
-        let mut scratch =
-            vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        let mut scratch = vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
         let bins = compute_waterfall_bins(&samples, 0, &hann, &*fft, &mut scratch);
         let (peak_idx, _) = bins
             .iter()

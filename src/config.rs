@@ -171,8 +171,9 @@ impl Config {
                     .ok_or_else(|| Error::msg("config: `beacon` must be a mapping"))?;
                 let offset_hz = match m.get("offset_hz") {
                     Some(v) => yaml::parse_f64(
-                        v.as_scalar()
-                            .ok_or_else(|| Error::msg("config: `beacon.offset_hz` must be a scalar"))?,
+                        v.as_scalar().ok_or_else(|| {
+                            Error::msg("config: `beacon.offset_hz` must be a scalar")
+                        })?,
                         "beacon.offset_hz",
                     )?,
                     None => 0.0,
@@ -399,10 +400,12 @@ microwaveprop:
             ("gain", "NaN"),
             ("ppm", "-inf"),
         ] {
-            let yaml = format!(
-                "frequency: 28330000\nmode: cw\nsample_rate: 250000\n{field}: {value}\n"
+            let yaml =
+                format!("frequency: 28330000\nmode: cw\nsample_rate: 250000\n{field}: {value}\n");
+            assert!(
+                Config::from_yaml_str(&yaml).is_err(),
+                "accepted {field}: {value}"
             );
-            assert!(Config::from_yaml_str(&yaml).is_err(), "accepted {field}: {value}");
         }
     }
 

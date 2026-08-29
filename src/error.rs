@@ -89,7 +89,9 @@ mod tests {
     #[test]
     fn with_context_lazily_formats() {
         let r: std::result::Result<(), &str> = Err("boom");
-        let e = r.with_context(|| format!("widget {} failed", 42)).unwrap_err();
+        let e = r
+            .with_context(|| format!("widget {} failed", 42))
+            .unwrap_err();
         assert_eq!(format!("{}", e), "widget 42 failed: boom");
     }
 

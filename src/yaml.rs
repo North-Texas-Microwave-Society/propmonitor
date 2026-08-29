@@ -204,18 +204,12 @@ fn insert_unique(
 
 // ---------------- typed accessors -------------------------------------
 
-pub fn require<'a>(
-    map: &'a BTreeMap<String, Value>,
-    key: &str,
-) -> Result<&'a Value> {
+pub fn require<'a>(map: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a Value> {
     map.get(key)
         .ok_or_else(|| Error::msg(format!("config: missing required key `{}`", key)))
 }
 
-pub fn require_scalar<'a>(
-    map: &'a BTreeMap<String, Value>,
-    key: &str,
-) -> Result<&'a str> {
+pub fn require_scalar<'a>(map: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a str> {
     require(map, key)?
         .as_scalar()
         .ok_or_else(|| Error::msg(format!("config: `{}` must be a scalar", key)))
@@ -303,8 +297,8 @@ impl YamlWriter {
 pub fn write_atomic(path: &str, contents: &str) -> Result<()> {
     use std::io::Write;
     let tmp = format!("{}.tmp", path);
-    let mut f = std::fs::File::create(&tmp)
-        .map_err(|e| Error::msg(format!("create {}: {}", tmp, e)))?;
+    let mut f =
+        std::fs::File::create(&tmp).map_err(|e| Error::msg(format!("create {}: {}", tmp, e)))?;
     f.write_all(contents.as_bytes())
         .map_err(|e| Error::msg(format!("write {}: {}", tmp, e)))?;
     f.sync_all()
@@ -497,7 +491,10 @@ beacon:
         w.nested_scalar("bandwidth_hz", "300");
         let yaml = w.finish();
         let parsed = parse(&yaml).unwrap();
-        assert_eq!(parsed.get("frequency").unwrap().as_scalar(), Some("28330000"));
+        assert_eq!(
+            parsed.get("frequency").unwrap().as_scalar(),
+            Some("28330000")
+        );
         let b = parsed.get("beacon").unwrap().as_map().unwrap();
         assert_eq!(b.get("bandwidth_hz").unwrap().as_scalar(), Some("300"));
     }
@@ -506,10 +503,8 @@ beacon:
     fn write_atomic_replaces_file_contents() {
         // Pick a path in the OS temp dir keyed by the test name + PID so
         // parallel test runs don't collide.
-        let path = std::env::temp_dir().join(format!(
-            "propmonitor-yaml-test-{}.yaml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("propmonitor-yaml-test-{}.yaml", std::process::id()));
         let path_str = path.to_str().unwrap();
         // Pre-populate so we exercise the rename-over-existing branch.
         std::fs::write(path_str, "old: content\n").unwrap();

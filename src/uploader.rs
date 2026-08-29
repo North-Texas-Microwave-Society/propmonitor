@@ -70,7 +70,10 @@ pub(crate) fn classify_status(status: reqwest::StatusCode) -> ResponseClass {
 /// Whether the configured microwaveprop block is fully populated enough
 /// to attempt uploads. Used both at queue-drain time and at enqueue time.
 pub(crate) fn should_upload(mw: &crate::config::MicrowavepropConfig) -> bool {
-    mw.enabled && !mw.monitor_token.is_empty() && !mw.beacon_id.is_empty() && !mw.gridsquare.is_empty()
+    mw.enabled
+        && !mw.monitor_token.is_empty()
+        && !mw.beacon_id.is_empty()
+        && !mw.gridsquare.is_empty()
 }
 
 /// Pick the gain value to stamp onto an upload. Prefers the SDR's
@@ -150,7 +153,10 @@ pub(crate) fn build_wire_measurement(
     }
 }
 
-pub fn new_event_channel() -> (broadcast::Sender<UploadEvent>, broadcast::Receiver<UploadEvent>) {
+pub fn new_event_channel() -> (
+    broadcast::Sender<UploadEvent>,
+    broadcast::Receiver<UploadEvent>,
+) {
     let (tx, rx) = broadcast::channel::<UploadEvent>(64);
     (tx, rx)
 }
@@ -251,10 +257,7 @@ pub async fn run(
                     let mut s = status.write().await;
                     s.enabled = true;
                 }
-                let gain_db = gain_from_device_info(
-                    device_info.read().await.as_ref(),
-                    c.gain,
-                );
+                let gain_db = gain_from_device_info(device_info.read().await.as_ref(), c.gain);
                 let m = build_wire_measurement(
                     &c,
                     mw,
@@ -313,7 +316,11 @@ async fn emit(
     {
         let mut s = status.write().await;
         s.last_post_at = Some(ev.at.clone());
-        s.last_status = Some(if ev.ok { "ok".to_string() } else { "error".to_string() });
+        s.last_status = Some(if ev.ok {
+            "ok".to_string()
+        } else {
+            "error".to_string()
+        });
         s.queued = ev.queued;
     }
     let _ = tx.send(ev);
@@ -384,10 +391,7 @@ mod tests {
         );
         // Anything else (1xx/3xx) lands in transient — we'll try again
         // rather than dropping a measurement we can't classify.
-        assert_eq!(
-            classify_status(StatusCode::FOUND),
-            ResponseClass::Transient
-        );
+        assert_eq!(classify_status(StatusCode::FOUND), ResponseClass::Transient);
     }
 
     #[test]
@@ -650,13 +654,7 @@ mod tests {
             ..Default::default()
         }));
 
-        let handle = tokio::spawn(run(
-            cfg,
-            device_info,
-            meas_rx,
-            up_tx,
-            status.clone(),
-        ));
+        let handle = tokio::spawn(run(cfg, device_info, meas_rx, up_tx, status.clone()));
 
         meas_tx
             .send(WsEvent::Measurement {
@@ -681,11 +679,7 @@ mod tests {
 
         // Drop the sender so `run`'s receiver sees Closed and exits.
         drop(meas_tx);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
 
     /// `run` should ignore non-measurement events (Waterfall, RawLevel,
@@ -712,13 +706,7 @@ mod tests {
         let (up_tx, _up_rx) = new_event_channel();
         let status = Arc::new(RwLock::new(UploaderStatus::default()));
 
-        let handle = tokio::spawn(run(
-            cfg,
-            device_info,
-            meas_rx,
-            up_tx,
-            status.clone(),
-        ));
+        let handle = tokio::spawn(run(cfg, device_info, meas_rx, up_tx, status.clone()));
 
         meas_tx.send(WsEvent::RawLevel { dbfs: -34.0 }).unwrap();
         meas_tx
@@ -734,11 +722,7 @@ mod tests {
         assert!(!status.read().await.enabled);
 
         drop(meas_tx);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
 
     #[test]

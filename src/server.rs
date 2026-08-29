@@ -21,7 +21,7 @@ use tokio::sync::{broadcast, Notify, RwLock};
 use crate::config::Config;
 use crate::error::Error;
 use crate::store::{MeasurementStore, MAX_ENTRIES};
-use crate::uploader::{UploaderStatus, UploadEvent};
+use crate::uploader::{UploadEvent, UploaderStatus};
 use crate::worker::{run_worker, WorkerEvent};
 
 /// Maximum payload we'll forward to a single WebSocket client without
@@ -207,7 +207,10 @@ async fn asset_js() -> Response {
     static JS: &str = include_str!("web/app.js");
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         JS,
     )
         .into_response()
@@ -465,11 +468,7 @@ fn enumerate_devices() -> Vec<DeviceOption> {
     };
     let mut out = Vec::with_capacity(args_list.len());
     for args in args_list {
-        let get = |k: &str| {
-            args.get(k)
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-        };
+        let get = |k: &str| args.get(k).map(|s| s.to_string()).filter(|s| !s.is_empty());
         let driver = match get("driver") {
             Some(d) => d,
             None => continue, // skip entries without a driver name
@@ -533,10 +532,7 @@ async fn get_measurements(
     Json(json!({ "measurements": store.recent(limit) })).into_response()
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
@@ -765,10 +761,7 @@ fn bridge_loop(
 /// re-broadcast them on the WS channel. The uploader has already updated
 /// `state.uploader_status` (it owns the same Arc<RwLock<…>>), so this
 /// function just forwards.
-pub async fn forward_upload_events(
-    state: Arc<AppState>,
-    mut rx: broadcast::Receiver<UploadEvent>,
-) {
+pub async fn forward_upload_events(state: Arc<AppState>, mut rx: broadcast::Receiver<UploadEvent>) {
     loop {
         match rx.recv().await {
             Ok(ev) => {
@@ -924,7 +917,10 @@ mod tests {
         body.microwaveprop.as_mut().unwrap().monitor_token = "redacted".to_string();
         let yaml = build_yaml_from_update(&body, "original-secret", 60).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
-        assert_eq!(parsed.microwaveprop.unwrap().monitor_token, "original-secret");
+        assert_eq!(
+            parsed.microwaveprop.unwrap().monitor_token,
+            "original-secret"
+        );
     }
 
     #[test]
@@ -1066,7 +1062,11 @@ mod tests {
         assert_eq!(stamp_event(&ev, "T2", &mut period_start), "T1");
         // Unrelated events carry the current clock, not the stale start.
         assert_eq!(
-            stamp_event(&WorkerEvent::RawLevel { dbfs: -34.0 }, "T2", &mut period_start),
+            stamp_event(
+                &WorkerEvent::RawLevel { dbfs: -34.0 },
+                "T2",
+                &mut period_start
+            ),
             "T2"
         );
     }
@@ -1258,15 +1258,19 @@ mod tests {
         use tower::ServiceExt;
         let state = test_state(sample_cfg(), "config.yaml");
         *state.last_raw_dbfs.write().await = Some(-42.0);
-        state.store.write().await.push(crate::store::StoredMeasurement {
-            measured_at: "2026-05-13T15:30:00Z".to_string(),
-            noise_floor_dbfs: -110.0,
-            signal_peak_dbfs: -88.0,
-            signal_avg_dbfs: -89.0,
-            snr_peak_db: 22.0,
-            snr_avg_db: 21.0,
-            signal_active_fraction: 0.5,
-        });
+        state
+            .store
+            .write()
+            .await
+            .push(crate::store::StoredMeasurement {
+                measured_at: "2026-05-13T15:30:00Z".to_string(),
+                noise_floor_dbfs: -110.0,
+                signal_peak_dbfs: -88.0,
+                signal_avg_dbfs: -89.0,
+                snr_peak_db: 22.0,
+                snr_avg_db: 21.0,
+                signal_active_fraction: 0.5,
+            });
         let app = build_router(state);
         let resp = app
             .oneshot(
@@ -1291,15 +1295,19 @@ mod tests {
         use tower::ServiceExt;
         let state = test_state(sample_cfg(), "config.yaml");
         for i in 0..3 {
-            state.store.write().await.push(crate::store::StoredMeasurement {
-                measured_at: format!("2026-05-13T00:{:02}:00Z", i),
-                noise_floor_dbfs: -110.0,
-                signal_peak_dbfs: -90.0 + i as f64,
-                signal_avg_dbfs: -91.0,
-                snr_peak_db: 20.0,
-                snr_avg_db: 18.0,
-                signal_active_fraction: 1.0,
-            });
+            state
+                .store
+                .write()
+                .await
+                .push(crate::store::StoredMeasurement {
+                    measured_at: format!("2026-05-13T00:{:02}:00Z", i),
+                    noise_floor_dbfs: -110.0,
+                    signal_peak_dbfs: -90.0 + i as f64,
+                    signal_avg_dbfs: -91.0,
+                    snr_peak_db: 20.0,
+                    snr_avg_db: 18.0,
+                    signal_active_fraction: 1.0,
+                });
         }
         let app = build_router(state);
         let resp = app
@@ -1383,7 +1391,10 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let app = build_router(test_state(sample_cfg(), "/tmp/propmonitor-test-put-bad.yaml"));
+        let app = build_router(test_state(
+            sample_cfg(),
+            "/tmp/propmonitor-test-put-bad.yaml",
+        ));
         // mode=beacon with no beacon block — should fail validation.
         let body = serde_json::json!({
             "frequency": 28330000,
@@ -1428,13 +1439,10 @@ mod tests {
             })
             .unwrap();
 
-        let got = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            ws_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         match got {
             WsEvent::Upload { status, .. } => assert_eq!(status, "ok"),
             other => panic!("expected upload, got {:?}", other),

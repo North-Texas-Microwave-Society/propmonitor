@@ -92,8 +92,8 @@ impl SpectrumAnalyzer {
         let half_width_bins = ((width_hz / bin_hz) / 2.0).round().max(1.0) as isize;
 
         self.sig_lo = (center_bin + offset_bins - half_width_bins).max(0) as usize;
-        self.sig_hi = (center_bin + offset_bins + half_width_bins)
-            .min(FFT_SIZE as isize - 1) as usize;
+        self.sig_hi =
+            (center_bin + offset_bins + half_width_bins).min(FFT_SIZE as isize - 1) as usize;
         self.half_width_bins = half_width_bins as usize;
 
         for p in self.psd_sum.iter_mut() {

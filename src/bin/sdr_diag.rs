@@ -121,8 +121,7 @@ fn main() {
     }
 
     eprintln!("# device args: {device_args}");
-    let dev =
-        soapysdr::Device::new(device_args.as_str()).expect("failed to open device");
+    let dev = soapysdr::Device::new(device_args.as_str()).expect("failed to open device");
 
     dev.set_sample_rate(Rx, 0, args.rate)
         .expect("set_sample_rate failed");
@@ -130,8 +129,7 @@ fn main() {
         .expect("set_frequency failed");
 
     if let Some(bw) = args.bandwidth {
-        dev.set_bandwidth(Rx, 0, bw)
-            .expect("set_bandwidth failed");
+        dev.set_bandwidth(Rx, 0, bw).expect("set_bandwidth failed");
     }
 
     if let Some(_dc) = args.dc_removal {
@@ -176,8 +174,7 @@ fn main() {
 
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FFT_N);
-    let mut fft_scratch =
-        vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+    let mut fft_scratch = vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
     let hann = hann_window(FFT_N);
 
     let mut ring = vec![Complex32::new(0.0, 0.0); FFT_N];
@@ -232,8 +229,7 @@ fn main() {
             samples_since_fft += 1;
             if samples_since_fft >= fft_interval && ring_filled >= FFT_N {
                 samples_since_fft = 0;
-                let bins =
-                    compute_bins(&ring, ring_pos, &hann, &*fft, &mut fft_scratch);
+                let bins = compute_bins(&ring, ring_pos, &hann, &*fft, &mut fft_scratch);
                 for (i, &p) in bins.iter().enumerate() {
                     if p > max_hold[i] {
                         max_hold[i] = p;
@@ -244,8 +240,14 @@ fn main() {
         }
     }
 
-    println!("# captured: rows={fft_rows} duration={:.1}s", start.elapsed().as_secs_f32());
-    let rms_dbfs = 10.0 * (total_iq_power / total_iq_n.max(1) as f64).max(1e-30).log10();
+    println!(
+        "# captured: rows={fft_rows} duration={:.1}s",
+        start.elapsed().as_secs_f32()
+    );
+    let rms_dbfs = 10.0
+        * (total_iq_power / total_iq_n.max(1) as f64)
+            .max(1e-30)
+            .log10();
     println!("# raw RMS: {rms_dbfs:+.2} dBFS over {total_iq_n} samples");
 
     // Find DC bin (must be center for our convention)
