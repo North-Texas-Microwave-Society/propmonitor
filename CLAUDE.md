@@ -77,7 +77,7 @@ One process owns the SDR (single-instance). Inside the process:
   small set of fields the config uses. No serde/yaml dep.
 - **`src/timefmt.rs`** — Portable Unix-seconds → ISO-8601 UTC
   formatting via Howard Hinnant's `civil_from_days` algorithm. No
-  `gmtime_r` so it works on Windows MSVC.
+  `gmtime_r`, so there's no libc dependency to vary across targets.
 - **`src/web/`** — Embedded HTML/CSS/JS (single page, no build step).
   Canvas waterfall, settings form bound to `/api/config`, live dBFS +
   measurement readouts, upload-status line.
@@ -108,9 +108,12 @@ continuous carriers (FM/AM). Tests in `measure.rs` pin that contract.
 - Gain handling: if `cfg.gain` is `Some`, AGC is explicitly disabled and
   the gain is set. RTL-SDR's `TUNER` element gets the value; other
   drivers fall back to `set_gain`. If `cfg.gain` is `None`, AGC is on.
-- The HTTP `bind` field can be `0.0.0.0:port` for LAN access, but the
-  startup message prints the loopback URL (`http://127.0.0.1:port`) that
-  actually works in a browser — `main.rs` does this substitution.
+- The HTTP `bind` field defaults to `0.0.0.0:port` so the UI is reachable
+  over the LAN, which is the only way to reach it on a headless install.
+  `spawn_server` logs the actual bound address; don't add a second
+  hardcoded-loopback log line next to it.
 - The microwaveprop ingest endpoint **doesn't yet exist on the server
   side** — see `api.md` §4 for the wire contract this client targets.
-- Windows builds aren't in CI. See `windows_build.md`.
+- Linux-only by design: the deployment target is a headless Debian /
+  Raspberry Pi OS box running the systemd unit from `install.sh`. CI
+  builds x86_64, aarch64 and armv7 Linux only.

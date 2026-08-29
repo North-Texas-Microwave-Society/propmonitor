@@ -6,8 +6,8 @@ over a configurable integration window, and uploads the measurements to
 [microwaveprop](https://prop.w5isp.com) so beacon strength can be
 correlated with weather over time.
 
-Includes a live web UI (waterfall, dBFS readout, settings form) on
-`http://127.0.0.1:5760`.
+Includes a live web UI (waterfall, dBFS readout, settings form) on port
+`5760`, reachable at `http://<host-ip>:5760`.
 
 ## Quick install (Debian 13 / Raspberry Pi OS)
 
@@ -28,7 +28,8 @@ The installer is safe to re-run — it won't overwrite your `config.yaml`.
 
 ## Build from source
 
-If you prefer to build from source or need to run on macOS/Windows:
+The deployment target is a headless Linux box. Building locally on macOS
+works for development:
 
 ### Requirements
 
@@ -48,10 +49,6 @@ brew install soapysdr soapyrtlsdr
 ```bash
 sudo apt install libsoapysdr-dev soapysdr-module-rtlsdr librtlsdr-dev
 ```
-
-### Windows
-
-See [`windows_build.md`](./windows_build.md).
 
 ## Build & run
 

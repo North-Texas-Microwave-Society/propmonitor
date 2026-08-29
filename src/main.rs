@@ -47,15 +47,10 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let port = bind
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(5760);
-    eprintln!(
-        "propmonitor: listening on http://127.0.0.1:{} (Ctrl+C to exit)",
-        port
-    );
+    // No "listening on" line here — `spawn_server` already logs the real
+    // bound address. Printing a hardcoded 127.0.0.1 alongside it was
+    // actively misleading on a headless install, where the UI is only
+    // reachable over the LAN address.
 
     // Block the main thread until Ctrl+C
     rt.block_on(async {

@@ -184,7 +184,12 @@ fi
 # ---------------------------------------------------------------------------
 step "Setting up configuration"
 
-install -d -m 755 -o root -g root "${CONFIG_DIR}"
+# Owned by root, group-writable by the service user. propmonitor rewrites
+# config.yaml when settings are saved from the web UI, and the atomic
+# write creates `config.yaml.tmp` in this directory first — so the
+# service group needs write on the DIRECTORY, not just the file. The
+# setgid bit keeps that tmp file in the service group.
+install -d -m 2770 -o root -g "${SERVICE_USER}" "${CONFIG_DIR}"
 
 if [[ -f "${CONFIG_DIR}/config.yaml" ]]; then
     info "config.yaml already exists — leaving it alone."
@@ -250,7 +255,6 @@ yaml_set "${CONFIG_DIR}/config.yaml" "ppm"             "${PPM}"
 if [[ -n "${GRID}" || -n "${TOKEN}" || -n "${BEACON_ID}" ]]; then
     sed -i 's/^# microwaveprop:/microwaveprop:/' "${CONFIG_DIR}/config.yaml"
     sed -i 's/^#   enabled:/  enabled:/'         "${CONFIG_DIR}/config.yaml"
-    local g_esc t_esc b_esc
     g_esc=$(escape_sed "${GRID}")
     t_esc=$(escape_sed "${TOKEN}")
     b_esc=$(escape_sed "${BEACON_ID}")
@@ -260,8 +264,11 @@ if [[ -n "${GRID}" || -n "${TOKEN}" || -n "${BEACON_ID}" ]]; then
     info "Upload credentials written to config."
 fi
 
+# 660, not 640: the service user rewrites this file when settings are
+# saved from the web UI. Group-only read keeps monitor_token off-limits
+# to other local users.
 chown root:"${SERVICE_USER}" "${CONFIG_DIR}/config.yaml"
-chmod 640 "${CONFIG_DIR}/config.yaml"
+chmod 660 "${CONFIG_DIR}/config.yaml"
 
 # ---------------------------------------------------------------------------
 # Systemd service
@@ -271,8 +278,18 @@ step "Installing systemd service"
 cat > /etc/systemd/system/propmonitor.service <<SERVICE
 [Unit]
 Description=propmonitor — SDR beacon signal monitor
-After=network.target
 Documentation=https://github.com/${REPO}
+# network-online, not just network.target: the uploader has to resolve
+# and reach prop.w5isp.com. network.target is reached before DHCP/DNS
+# are usable, so plain After=network.target means the first upload
+# attempts after a boot fail and sit in the retry queue for no reason.
+Wants=network-online.target
+After=network-online.target
+# Never permanently give up. The default start-rate limit (5 starts in
+# 10 s) latches the unit into "failed" if the SDR dongle is missing at
+# boot; an unattended monitor must keep retrying so that plugging the
+# dongle in later is enough to recover without a manual systemctl call.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -286,9 +303,24 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=propmonitor
 
-# Basic hardening (SDR needs USB access, so we keep it light)
+# Hardening. Deliberately does NOT set PrivateDevices=yes or
+# DeviceAllow: SoapySDR needs raw USB access to the dongle via
+# /dev/bus/usb, and PrivateDevices hides it.
 NoNewPrivileges=yes
 PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# config.yaml is rewritten in place when settings are saved from the
+# web UI, so this one path stays writable under ProtectSystem=strict.
+ReadWritePaths=${CONFIG_DIR}
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
