@@ -145,6 +145,29 @@ Afterwards:
 | Restart         | `sudo systemctl restart propmonitor`            |
 | Service status  | `systemctl status propmonitor`                  |
 
+### Installing a managed monitor (one line, nothing to answer)
+
+A monitor's page on [prop.w5isp.com](https://prop.w5isp.com) hands out the
+command for *that* monitor, with its token already in it:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/North-Texas-Microwave-Society/propmonitor/main/install.sh \
+  | sudo PROPMONITOR_NONINTERACTIVE=1 PROPMONITOR_MONITOR_TOKEN=<token> bash
+```
+
+`PROPMONITOR_MONITOR_TOKEN` seeds `microwaveprop.monitor_token`, and a token
+is all the identity a node needs: config sync starts as soon as one exists,
+the website recognises the monitor it belongs to, and the frequency, driver,
+beacon and grid square are pushed down from that monitor's page. So the
+installer's questions are exactly the ones the website answers — hence
+`PROPMONITOR_NONINTERACTIVE=1`, which takes the defaults for all of them.
+Uploads themselves begin once the pushed config has arrived, since a
+measurement needs the beacon and the grid square it was taken with.
+
+An environment token outranks the one already in `config.yaml`, which is how
+the same command re-points a node at a different monitor. Everything else
+still comes from the file, so a re-run without the variable changes nothing.
+
 ### Staying up to date
 
 **A node keeps itself current.** It follows the `main` branch: every push
@@ -211,6 +234,9 @@ Accept every default without prompting:
 curl -sSL https://raw.githubusercontent.com/North-Texas-Microwave-Society/propmonitor/main/install.sh \
   | sudo PROPMONITOR_NONINTERACTIVE=1 bash
 ```
+
+Add `PROPMONITOR_MONITOR_TOKEN=<token>` to bind the node to a monitor in the
+same command — see *Installing a managed monitor* above.
 
 ### Uninstalling
 

@@ -14,6 +14,13 @@
 # Non-interactive (CI, cloud-init, Ansible):
 #   curl -sSL .../install.sh | sudo PROPMONITOR_NONINTERACTIVE=1 bash
 # accepts every default without prompting.
+#
+# Pre-seeded (the one-liner a monitor's page on prop.w5isp.com hands out):
+#   curl -sSL .../install.sh \
+#     | sudo PROPMONITOR_NONINTERACTIVE=1 PROPMONITOR_MONITOR_TOKEN=<token> bash
+# installs a node already bound to that monitor. The token is the only
+# setting it needs: the website pushes the frequency, the driver, the beacon
+# and the grid square down to the node once it connects.
 
 set -euo pipefail
 
@@ -99,6 +106,18 @@ ask() {
         fi
         echo "      ${YLW}Invalid value: ${reply}${RST}" >&2
     done
+}
+
+# env_default ENV_NAME FILE_VALUE
+#
+# A value handed in through the environment is this run's explicit intent,
+# so it outranks what is already on disk — that is how the website's install
+# one-liner binds a fresh node to a monitor. With the variable unset (every
+# ordinary install, and every re-run) the file wins, which is what keeps
+# re-running the installer a no-op.
+env_default() {
+    local from_env="${!1:-}"
+    printf '%s' "${from_env:-$2}"
 }
 
 is_number()   { [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
@@ -584,7 +603,7 @@ update:                        # self-update from the GitHub release channel
   auto: true                   # install them and restart in place
   check_interval: 3600         # seconds between checks, minimum 60
 
-# Uploads to prop.w5isp.com. All three fields are required.
+# Uploads to prop.w5isp.com. A monitor_token is what turns them on.
 # microwaveprop:
 #   enabled: true
 #   gridsquare: ""             # Maidenhead grid square, e.g. "FN31pr"
@@ -627,9 +646,14 @@ echo
 echo "  ${BLD}Beacon reporting to prop.w5isp.com${RST} (optional — Enter to skip)"
 echo
 
-GRID=$(ask      "Gridsquare (4-20 chars)"     "$(yaml_get "$CONFIG" "  gridsquare")"    is_grid)
-TOKEN=$(ask     "Monitor token"               "$(yaml_get "$CONFIG" "  monitor_token")" is_plain)
-BEACON_ID=$(ask "Beacon UUID"                 "$(yaml_get "$CONFIG" "  beacon_id")"     is_plain)
+# The grid square and beacon are seeded from the file alone: for a managed
+# monitor the website pushes both. The token is the one value a caller can
+# hand in, because it is what binds this node to a monitor in the first place.
+GRID=$(ask  "Gridsquare (4-20 chars)" "$(yaml_get "$CONFIG" "  gridsquare")" is_grid)
+TOKEN=$(ask "Monitor token" \
+            "$(env_default PROPMONITOR_MONITOR_TOKEN "$(yaml_get "$CONFIG" "  monitor_token")")" \
+            is_plain)
+BEACON_ID=$(ask "Beacon UUID" "$(yaml_get "$CONFIG" "  beacon_id")" is_plain)
 # Not prompted: the sync version is bookkeeping between the node and
 # prop.w5isp.com, minted only by the website. Carry it across a re-run so
 # an upgrade doesn't look like a node that never applied its config (which
@@ -638,9 +662,13 @@ CONFIG_VERSION=$(yaml_get "$CONFIG" "  config_version")
 
 yaml_drop_microwaveprop "$CONFIG"
 
-if [[ -n "$GRID" && -n "$TOKEN" && -n "$BEACON_ID" ]]; then
-    # Only enable with all three present. A half-filled block still parses,
-    # so the daemon would start and then push rejected uploads forever.
+# The token is the switch. A managed monitor is configured from the website,
+# which pushes the grid square and the beacon to the node as soon as it
+# connects — so demanding all three here would leave a pre-seeded node with
+# its token in a commented-out block and sync that never starts. Uploads
+# still wait for all three (`should_upload`, src/uploader.rs), so nothing is
+# posted half-configured either way.
+if [[ -n "$TOKEN" ]]; then
     {
         echo
         echo "microwaveprop:"
@@ -652,20 +680,25 @@ if [[ -n "$GRID" && -n "$TOKEN" && -n "$BEACON_ID" ]]; then
             echo "  config_version: ${CONFIG_VERSION}"
         fi
     } >> "$CONFIG"
-    info "Uploads enabled for gridsquare ${GRID}."
+    if [[ -n "$GRID" && -n "$BEACON_ID" ]]; then
+        info "Uploads enabled for gridsquare ${GRID}."
+    else
+        info "Token set: this node registers with prop.w5isp.com and takes its"
+        info "grid square and beacon from there. Uploads start once it has them."
+    fi
 else
     {
         echo
-        echo "# Uploads to prop.w5isp.com. All three fields are required."
+        echo "# Uploads to prop.w5isp.com. A monitor_token is what turns them on."
         echo "# microwaveprop:"
         echo "#   enabled: true"
         echo "#   gridsquare: \"${GRID}\""
-        echo "#   monitor_token: \"${TOKEN}\""
+        echo "#   monitor_token: \"\""
         echo "#   beacon_id: \"${BEACON_ID}\""
     } >> "$CONFIG"
-    if [[ -n "$GRID$TOKEN$BEACON_ID" ]]; then
-        warn "Uploads need gridsquare + token + beacon UUID; got only some."
-        warn "Left disabled. Fill in the commented block in ${CONFIG}."
+    if [[ -n "$GRID$BEACON_ID" ]]; then
+        warn "No monitor token, so uploads stay off. Copy one from the monitor's"
+        warn "page on prop.w5isp.com into ${CONFIG}, or re-run this installer."
     else
         info "Uploads left disabled (UI-only install)."
     fi
