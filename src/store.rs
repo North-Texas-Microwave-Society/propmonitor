@@ -4,9 +4,12 @@
 
 use std::collections::VecDeque;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+/// `Deserialize` because this is a wire type in both directions now: it
+/// goes out in `GET /api/measurements` and in the sync status frame
+/// (`sync.rs`), and the round-trip tests read it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredMeasurement {
     pub measured_at: String, // UTC ISO-8601
     pub noise_floor_dbfs: f64,

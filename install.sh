@@ -579,6 +579,11 @@ echo
 GRID=$(ask      "Gridsquare (4-20 chars)"     "$(yaml_get "$CONFIG" "  gridsquare")"    is_grid)
 TOKEN=$(ask     "Monitor token"               "$(yaml_get "$CONFIG" "  monitor_token")" is_plain)
 BEACON_ID=$(ask "Beacon UUID"                 "$(yaml_get "$CONFIG" "  beacon_id")"     is_plain)
+# Not prompted: the sync version is bookkeeping between the node and
+# prop.w5isp.com, minted only by the website. Carry it across a re-run so
+# an upgrade doesn't look like a node that never applied its config (which
+# would make the website re-push, restarting the SDR for nothing).
+CONFIG_VERSION=$(yaml_get "$CONFIG" "  config_version")
 
 yaml_drop_microwaveprop "$CONFIG"
 
@@ -592,6 +597,9 @@ if [[ -n "$GRID" && -n "$TOKEN" && -n "$BEACON_ID" ]]; then
         echo "  gridsquare: \"${GRID}\""
         echo "  monitor_token: \"${TOKEN}\""
         echo "  beacon_id: \"${BEACON_ID}\""
+        if [[ -n "$CONFIG_VERSION" ]]; then
+            echo "  config_version: ${CONFIG_VERSION}"
+        fi
     } >> "$CONFIG"
     info "Uploads enabled for gridsquare ${GRID}."
 else

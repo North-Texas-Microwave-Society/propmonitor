@@ -62,6 +62,15 @@ One process owns the SDR (single-instance). Inside the process:
   config (callsign, frequency, passband), POSTs to microwaveprop with
   Bearer auth. Failures go into a bounded retry queue (cap 1440 = 24 h)
   with exponential backoff (1 s → 5 min).
+- **`src/sync.rs`** — Two-way config sync with microwaveprop for
+  **managed** monitors (`api.md` §5). Long-running tokio task: WebSocket
+  to `MICROWAVEPROP_SYNC_ENDPOINT` with 1 s → 5 min reconnect backoff,
+  `hello` on connect, config pushed down / local edits reported up, 60 s
+  status heartbeat, 30 s protocol pings, and a 60 s HTTP polling cycle
+  while the socket is down. Idles until `microwaveprop.monitor_token`
+  exists, woken by `AppState::sync_notify`, so a self-service install
+  never talks to the endpoint and pasting a token in the LAN UI starts
+  sync without a restart.
 - **`src/measure.rs`** — `SpectrumAnalyzer`: Hann-windowed FFT,
   fftshift on the fly, in-band peak + average tracking, median-of-out-
   of-passband noise floor with a guard region. `start_window(offset_hz,
@@ -112,8 +121,25 @@ continuous carriers (FM/AM). Tests in `measure.rs` pin that contract.
   over the LAN, which is the only way to reach it on a headless install.
   `spawn_server` logs the actual bound address; don't add a second
   hardcoded-loopback log line next to it.
-- The microwaveprop ingest endpoint **doesn't yet exist on the server
-  side** — see `api.md` §4 for the wire contract this client targets.
+- Config writes go through one path: `server::apply_config` (yaml build →
+  parse/validate → rebind if needed → write_atomic → swap → worker
+  restart). `PUT /api/config` and `sync.rs` both call it; don't grow a
+  second one. `put_config` bumps `sync_notify` afterwards so the edit is
+  reported upstream — a config that arrived *from* microwaveprop must not
+  bump it, or the node and website mint versions at each other forever.
+  Both writers (and `persist_config_version`) hold `AppState::config_write`
+  for the whole read-modify-write; a new config writer must take it too.
+- `microwaveprop.config_version` is bookkeeping owned by microwaveprop.
+  The node persists and echoes it, never invents it. `persist_config_version`
+  records a version *without* restarting the worker; that's the whole point
+  of the content-compare no-op skip on a pushed config.
+- The sync wire shape (`sync::SyncConfig`) is a distinct struct with no
+  `monitor_token` field and no `http` block. Don't "simplify" it into
+  `ConfigView`: the token would leak and a bad pushed `bind` would strand
+  the LAN UI.
+- The microwaveprop ingest endpoint (`api.md` §4) and the sync socket +
+  polling endpoints (`api.md` §5) are being built on the microwaveprop
+  side in parallel; those sections are the contract both halves target.
 - Linux-only by design: the deployment target is a headless Debian /
   Raspberry Pi OS box running the systemd unit from `install.sh`. CI
   builds x86_64, aarch64 and armv7 Linux only.

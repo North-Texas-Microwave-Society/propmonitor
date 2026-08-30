@@ -358,6 +358,7 @@ mod tests {
 
     fn sample_mw() -> MicrowavepropConfig {
         MicrowavepropConfig {
+            config_version: 0,
             enabled: true,
             monitor_token: "token-123".to_string(),
             beacon_id: "00000000-0000-0000-0000-000000000001".to_string(),

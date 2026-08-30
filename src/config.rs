@@ -88,6 +88,12 @@ pub struct MicrowavepropConfig {
     /// propagation paths. Up to 20 characters. Leave empty to disable
     /// uploads.
     pub gridsquare: String,
+    /// Last config version microwaveprop handed this node (managed
+    /// monitors only). Versions are minted **only** by microwaveprop; the
+    /// node persists the last one it was given and echoes it back, so a
+    /// reboot doesn't look like "never applied" and trigger a spurious
+    /// re-apply of the config already on disk.
+    pub config_version: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -250,11 +256,26 @@ impl Config {
                     .and_then(|v| v.as_scalar())
                     .unwrap_or("")
                     .to_string();
+                let config_version = match m.get("config_version") {
+                    Some(v) => v
+                        .as_scalar()
+                        .ok_or_else(|| {
+                            Error::msg("config: `microwaveprop.config_version` must be a scalar")
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            Error::msg(
+                                "config: `microwaveprop.config_version` must be a non-negative integer",
+                            )
+                        })?,
+                    None => 0,
+                };
                 Some(MicrowavepropConfig {
                     enabled,
                     monitor_token,
                     beacon_id,
                     gridsquare,
+                    config_version,
                 })
             }
             None => None,
@@ -707,6 +728,47 @@ microwaveprop:
             assert!(
                 Config::from_yaml_str(&yaml).is_err(),
                 "accepted invalid gridsquare {gs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_version_parses_and_defaults_to_zero() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+microwaveprop:
+  monitor_token: \"token123\"
+  beacon_id: \"00000000-0000-0000-0000-000000000001\"
+  config_version: 42
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.microwaveprop.unwrap().config_version, 42);
+
+        // A managed monitor that has never been configured on the website
+        // — and every self-service install — has no key at all.
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+microwaveprop:
+  monitor_token: \"token123\"
+  beacon_id: \"00000000-0000-0000-0000-000000000001\"
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.microwaveprop.unwrap().config_version, 0);
+    }
+
+    #[test]
+    fn config_version_rejects_non_integers() {
+        for value in ["-1", "1.5", "\"seven\""] {
+            let yaml = format!(
+                "frequency: 28330000\nmode: cw\nsample_rate: 250000\nmicrowaveprop:\n  monitor_token: \"t\"\n  beacon_id: \"b\"\n  config_version: {value}\n"
+            );
+            assert!(
+                Config::from_yaml_str(&yaml).is_err(),
+                "accepted invalid config_version {value:?}"
             );
         }
     }

@@ -3,6 +3,7 @@ mod error;
 mod measure;
 mod server;
 mod store;
+mod sync;
 mod timefmt;
 mod uploader;
 mod worker;
@@ -78,6 +79,8 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
         uploader_status: uploader_status_arc.clone(),
         worker_handle: StdMutex::new(None),
         http_server: StdMutex::new(None),
+        sync_notify: tokio::sync::watch::Sender::new(0),
+        config_write: tokio::sync::Mutex::new(()),
     });
 
     {
@@ -102,6 +105,15 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
     {
         let state_for_uploads = state.clone();
         tokio::spawn(forward_upload_events(state_for_uploads, upload_rx));
+    }
+
+    // Config sync with microwaveprop. Idles until a `monitor_token` is
+    // configured, so a self-service install never touches the endpoint.
+    {
+        let state_for_sync = state.clone();
+        tokio::spawn(async move {
+            crate::sync::run(state_for_sync).await;
+        });
     }
 
     Ok(state)

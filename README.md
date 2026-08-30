@@ -217,6 +217,17 @@ Things worth knowing:
   "Send beacon reports" checkbox to pause reporting without erasing them.
 - The ingest URL is not configurable — it is `MICROWAVEPROP_ENDPOINT` in
   `src/uploader.rs`.
+- **Managed monitors are configured from the website.** If the monitor was
+  created on prop.w5isp.com as a *managed node*, the site holds the
+  authoritative config and pushes changes to this daemon over a WebSocket
+  (with HTTP polling as a backup). The LAN UI stays fully editable — local
+  edits are pushed back up, last write wins. The daemon also reports its
+  LAN address so the website can link to this UI. `config_version` under
+  `microwaveprop:` is bookkeeping written by the daemon; don't hand-edit
+  it. Nothing here activates until a `monitor_token` is set, so a
+  self-service install is unaffected. Protocol: `api.md` §5.
+- `http.bind` is deliberately **not** synced: a bad bind pushed from the
+  website would make this UI unreachable with no way back in.
 
 See [`api.md`](./api.md) for the full REST/WebSocket/upload contract.
 

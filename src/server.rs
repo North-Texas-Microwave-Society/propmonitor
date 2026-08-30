@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{broadcast, watch, Notify, RwLock};
 
 use crate::config::Config;
 use crate::error::Error;
@@ -90,6 +90,16 @@ pub struct AppState {
     /// Handle to the running HTTP server. Replaced on `http.bind` change so
     /// the listener can be rebound without restarting the process.
     pub http_server: StdMutex<Option<ServerHandle>>,
+    /// Bumped once per successful **local** config edit (`PUT /api/config`).
+    /// The microwaveprop sync task watches this and pushes the edit
+    /// upstream. Configs that arrived *from* microwaveprop don't bump it —
+    /// echoing them back would just mint versions for no reason.
+    pub sync_notify: watch::Sender<u64>,
+    /// Serializes config writes. `PUT /api/config` and the microwaveprop
+    /// sync task are independent writers, and both read the active config,
+    /// build a whole yaml document and write it back — interleaved, one
+    /// edit would silently vanish while its version was recorded.
+    pub config_write: tokio::sync::Mutex<()>,
 }
 
 pub struct WorkerHandle {
@@ -289,115 +299,219 @@ async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(cfg_to_view(&cfg)).into_response()
 }
 
-#[derive(Deserialize)]
-struct ConfigUpdate {
-    frequency: f64,
-    mode: String,
-    driver: String,
-    sample_rate: f64,
-    gain: Option<f64>,
-    ppm: Option<f64>,
-    period_seconds: Option<u32>,
-    beacon: Option<BeaconUpdate>,
-    http: Option<HttpUpdate>,
-    microwaveprop: Option<MicrowavepropUpdate>,
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigUpdate {
+    pub(crate) frequency: f64,
+    pub(crate) mode: String,
+    pub(crate) driver: String,
+    pub(crate) sample_rate: f64,
+    pub(crate) gain: Option<f64>,
+    pub(crate) ppm: Option<f64>,
+    pub(crate) period_seconds: Option<u32>,
+    pub(crate) beacon: Option<BeaconUpdate>,
+    pub(crate) http: Option<HttpUpdate>,
+    pub(crate) microwaveprop: Option<MicrowavepropUpdate>,
 }
 
-#[derive(Deserialize)]
-struct BeaconUpdate {
-    offset_hz: f64,
-    bandwidth_hz: f64,
+#[derive(Debug, Deserialize)]
+pub(crate) struct BeaconUpdate {
+    pub(crate) offset_hz: f64,
+    pub(crate) bandwidth_hz: f64,
 }
 
-#[derive(Deserialize)]
-struct HttpUpdate {
-    bind: String,
+#[derive(Debug, Deserialize)]
+pub(crate) struct HttpUpdate {
+    pub(crate) bind: String,
 }
 
-#[derive(Deserialize)]
-struct MicrowavepropUpdate {
+#[derive(Debug, Deserialize)]
+pub(crate) struct MicrowavepropUpdate {
     #[serde(default = "default_true")]
-    enabled: bool,
-    monitor_token: String,
-    beacon_id: String,
+    pub(crate) enabled: bool,
+    pub(crate) monitor_token: String,
+    pub(crate) beacon_id: String,
     #[serde(default)]
-    gridsquare: String,
+    pub(crate) gridsquare: String,
 }
 
 fn default_true() -> bool {
     true
 }
 
-async fn put_config(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<ConfigUpdate>,
-) -> Response {
-    // Resolve fields the UI doesn't necessarily send:
-    //   - monitor_token: "redacted" sentinel preserves the existing one.
-    //   - period_seconds: not in the UI form, so missing-on-PUT means
-    //     "keep the existing value", not "reset to default".
-    let (preserved_token, preserved_period, old_bind) = {
-        let cfg = state.config.read().await;
-        let token = cfg
-            .microwaveprop
-            .as_ref()
-            .map(|m| m.monitor_token.clone())
-            .unwrap_or_default();
-        (token, cfg.period_seconds, cfg.http.bind.clone())
-    };
+/// Why a config apply failed. Keeps the status split `put_config` had
+/// before its body moved into [`apply_config`]: a rejected body is the
+/// caller's fault, a failed write or rebind is ours.
+#[derive(Debug)]
+pub enum ApplyError {
+    Invalid(Error),
+    Internal(Error),
+}
 
-    let yaml = match build_yaml_from_update(&body, &preserved_token, preserved_period) {
-        Ok(y) => y,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()),
-    };
+impl ApplyError {
+    fn status(&self) -> StatusCode {
+        match self {
+            ApplyError::Invalid(_) => StatusCode::BAD_REQUEST,
+            ApplyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
 
-    let new_cfg = match Config::from_yaml_str(&yaml) {
-        Ok(c) => c,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()),
-    };
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyError::Invalid(e) | ApplyError::Internal(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
+/// Validate, persist and activate a config update. Shared by
+/// `PUT /api/config` and the microwaveprop sync task, so both surfaces get
+/// the same ordering guarantees: rebind before persist (a bad bind fails
+/// without touching the file on disk), persist before the in-memory swap,
+/// worker restart last.
+///
+/// `config_version` is the version to record under
+/// `microwaveprop.config_version`: `Some(v)` when the config came *from*
+/// microwaveprop, `None` to carry the persisted version forward (local
+/// edits — microwaveprop mints their version afterwards).
+pub async fn apply_config(
+    state: &Arc<AppState>,
+    body: &ConfigUpdate,
+    config_version: Option<u64>,
+) -> Result<Config, ApplyError> {
+    let _write = state.config_write.lock().await;
+    let current = state.config.read().await.clone();
+
+    let yaml =
+        build_yaml_from_update(body, &current, config_version).map_err(ApplyError::Invalid)?;
+    let new_cfg = Config::from_yaml_str(&yaml).map_err(ApplyError::Invalid)?;
 
     // If the bind address changed, rebind the HTTP listener *before*
     // persisting so a bad bind fails cleanly and leaves config on disk
     // untouched. `restart_server` never awaits the old server from inside
     // this request (see its doc comment).
-    if new_cfg.http.bind != old_bind {
-        if let Err(e) = restart_server(&state, &new_cfg.http.bind).await {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-        }
+    if new_cfg.http.bind != current.http.bind {
+        restart_server(state, &new_cfg.http.bind)
+            .await
+            .map_err(ApplyError::Internal)?;
     }
 
-    // Persist atomically.
-    if let Err(e) = crate::yaml::write_atomic(&state.config_path, &yaml) {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
+    crate::yaml::write_atomic(&state.config_path, &yaml).map_err(ApplyError::Internal)?;
 
-    // Swap in new config and restart the worker.
     {
-        let mut current = state.config.write().await;
-        *current = new_cfg.clone();
+        let mut active = state.config.write().await;
+        *active = new_cfg.clone();
     }
-    {
-        let mut handle = state
-            .worker_handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(mut h) = handle.take() {
-            h.stop_and_join();
-        }
-        let new_handle = spawn_worker_and_bridge(state.clone(), new_cfg.clone());
-        *handle = Some(new_handle);
-    }
+    restart_worker(state, &new_cfg);
 
-    let cfg = state.config.read().await;
-    Json(cfg_to_view(&cfg)).into_response()
+    Ok(new_cfg)
 }
 
+/// Stop the running worker + bridge and start a fresh pair on `cfg`. The
+/// SoapySDR device is released and reopened.
+fn restart_worker(state: &Arc<AppState>, cfg: &Config) {
+    let mut handle = state
+        .worker_handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mut h) = handle.take() {
+        h.stop_and_join();
+    }
+    *handle = Some(spawn_worker_and_bridge(state.clone(), cfg.clone()));
+}
+
+/// Record a microwaveprop-minted config version without disturbing the
+/// running config. Used when a pushed config is content-identical to the
+/// active one, and when microwaveprop mints a version for a local edit:
+/// neither case justifies dropping and reopening the SDR.
+pub async fn persist_config_version(state: &Arc<AppState>, version: u64) -> Result<(), Error> {
+    let _write = state.config_write.lock().await;
+    let mut active = state.config.write().await;
+    let Some(mw) = active.microwaveprop.as_mut() else {
+        return Err(Error::msg(
+            "cannot record a config version without a `microwaveprop:` block",
+        ));
+    };
+    if mw.config_version == version {
+        return Ok(());
+    }
+    mw.config_version = version;
+
+    let yaml = build_yaml_from_update(&cfg_to_update(&active), &active, Some(version))?;
+    crate::yaml::write_atomic(&state.config_path, &yaml)
+}
+
+async fn put_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ConfigUpdate>,
+) -> Response {
+    match apply_config(&state, &body, None).await {
+        Ok(cfg) => {
+            // Wake the sync task so the edit gets pushed up to
+            // microwaveprop (which mints the version for it).
+            state.sync_notify.send_modify(|n| *n += 1);
+            Json(cfg_to_view(&cfg)).into_response()
+        }
+        Err(e) => error_response(e.status(), e.to_string()),
+    }
+}
+
+/// Round-trip the active config back into the update shape, so the yaml
+/// writer has a single input type. Carries the *real* token rather than the
+/// `"redacted"` sentinel — the value never leaves the process.
+pub(crate) fn cfg_to_update(cfg: &Config) -> ConfigUpdate {
+    ConfigUpdate {
+        frequency: cfg.frequency,
+        mode: cfg.mode.as_str().to_string(),
+        driver: cfg.driver.clone(),
+        sample_rate: cfg.sample_rate,
+        gain: cfg.gain,
+        ppm: Some(cfg.ppm),
+        period_seconds: Some(cfg.period_seconds),
+        beacon: cfg.beacon.as_ref().map(|b| BeaconUpdate {
+            offset_hz: b.offset_hz,
+            bandwidth_hz: b.bandwidth_hz,
+        }),
+        http: Some(HttpUpdate {
+            bind: cfg.http.bind.clone(),
+        }),
+        microwaveprop: cfg.microwaveprop.as_ref().map(|m| MicrowavepropUpdate {
+            enabled: m.enabled,
+            monitor_token: m.monitor_token.clone(),
+            beacon_id: m.beacon_id.clone(),
+            gridsquare: m.gridsquare.clone(),
+        }),
+    }
+}
+
+/// Render an update as the on-disk yaml document. Fields the UI doesn't
+/// necessarily send are resolved against `current`:
+///
+///   - `monitor_token`: the `"redacted"` sentinel keeps the existing token.
+///   - `period_seconds`: absent means "keep", not "reset to default".
+///   - `microwaveprop.config_version`: `config_version` when the caller has
+///     a newly-minted one, otherwise the persisted value carries forward.
 fn build_yaml_from_update(
     body: &ConfigUpdate,
-    preserved_token: &str,
-    preserved_period: u32,
+    current: &Config,
+    config_version: Option<u64>,
 ) -> Result<String, Error> {
     use crate::yaml::YamlWriter;
+    let preserved_token = current
+        .microwaveprop
+        .as_ref()
+        .map(|m| m.monitor_token.as_str())
+        .unwrap_or("");
+    let version = config_version.unwrap_or_else(|| {
+        current
+            .microwaveprop
+            .as_ref()
+            .map(|m| m.config_version)
+            .unwrap_or(0)
+    });
+
     let mut w = YamlWriter::new();
     w.scalar("frequency", &body.frequency.to_string());
     w.scalar("mode", &body.mode);
@@ -409,7 +523,7 @@ fn build_yaml_from_update(
     w.scalar("ppm", &format!("{}", body.ppm.unwrap_or(0.0)));
     w.scalar(
         "period_seconds",
-        &format!("{}", body.period_seconds.unwrap_or(preserved_period)),
+        &format!("{}", body.period_seconds.unwrap_or(current.period_seconds)),
     );
 
     if let Some(b) = &body.beacon {
@@ -437,6 +551,7 @@ fn build_yaml_from_update(
         w.nested_string("monitor_token", &token);
         w.nested_string("beacon_id", &m.beacon_id);
         w.nested_string("gridsquare", &m.gridsquare);
+        w.nested_scalar("config_version", &version.to_string());
     }
 
     Ok(w.finish())
@@ -810,6 +925,7 @@ mod tests {
                 monitor_token: "secret-token".to_string(),
                 beacon_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 gridsquare: "EM12il".to_string(),
+                config_version: 7,
             }),
         }
     }
@@ -887,8 +1003,7 @@ mod tests {
 
     #[test]
     fn build_yaml_from_update_round_trips_through_parser() {
-        let body = sample_update();
-        let yaml = build_yaml_from_update(&body, "preserved-token", 60).unwrap();
+        let yaml = build_yaml_from_update(&sample_update(), &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(parsed.frequency, 28_330_000.0);
         assert_eq!(parsed.mode, Mode::Beacon);
@@ -905,7 +1020,7 @@ mod tests {
         let mut body = sample_update();
         body.frequency = 28_330_000.5;
         body.sample_rate = 250_000.25;
-        let yaml = build_yaml_from_update(&body, "tok", 60).unwrap();
+        let yaml = build_yaml_from_update(&body, &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(parsed.frequency, 28_330_000.5);
         assert_eq!(parsed.sample_rate, 250_000.25);
@@ -915,18 +1030,17 @@ mod tests {
     fn build_yaml_from_update_preserves_token_on_redacted_sentinel() {
         let mut body = sample_update();
         body.microwaveprop.as_mut().unwrap().monitor_token = "redacted".to_string();
-        let yaml = build_yaml_from_update(&body, "original-secret", 60).unwrap();
+        let yaml = build_yaml_from_update(&body, &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
-        assert_eq!(
-            parsed.microwaveprop.unwrap().monitor_token,
-            "original-secret"
-        );
+        assert_eq!(parsed.microwaveprop.unwrap().monitor_token, "secret-token");
     }
 
     #[test]
     fn build_yaml_from_update_preserves_period_when_missing_from_body() {
         let body = sample_update(); // period_seconds: None
-        let yaml = build_yaml_from_update(&body, "tok", 45).unwrap();
+        let mut current = sample_cfg();
+        current.period_seconds = 45;
+        let yaml = build_yaml_from_update(&body, &current, None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(parsed.period_seconds, 45);
     }
@@ -935,7 +1049,9 @@ mod tests {
     fn build_yaml_from_update_uses_explicit_period_when_provided() {
         let mut body = sample_update();
         body.period_seconds = Some(120);
-        let yaml = build_yaml_from_update(&body, "tok", 45).unwrap();
+        let mut current = sample_cfg();
+        current.period_seconds = 45;
+        let yaml = build_yaml_from_update(&body, &current, None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(parsed.period_seconds, 120);
     }
@@ -944,7 +1060,7 @@ mod tests {
     fn build_yaml_from_update_omits_microwaveprop_block_when_absent() {
         let mut body = sample_update();
         body.microwaveprop = None;
-        let yaml = build_yaml_from_update(&body, "tok", 60).unwrap();
+        let yaml = build_yaml_from_update(&body, &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert!(parsed.microwaveprop.is_none());
     }
@@ -953,7 +1069,7 @@ mod tests {
     fn build_yaml_from_update_handles_missing_http() {
         let mut body = sample_update();
         body.http = None;
-        let yaml = build_yaml_from_update(&body, "tok", 60).unwrap();
+        let yaml = build_yaml_from_update(&body, &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert_eq!(parsed.http.bind, "0.0.0.0:5760");
     }
@@ -962,7 +1078,7 @@ mod tests {
     fn build_yaml_from_update_handles_no_gain_for_agc() {
         let mut body = sample_update();
         body.gain = None;
-        let yaml = build_yaml_from_update(&body, "tok", 60).unwrap();
+        let yaml = build_yaml_from_update(&body, &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert!(parsed.gain.is_none());
     }
@@ -971,9 +1087,45 @@ mod tests {
     fn build_yaml_from_update_handles_disabled_microwaveprop() {
         let mut body = sample_update();
         body.microwaveprop.as_mut().unwrap().enabled = false;
-        let yaml = build_yaml_from_update(&body, "tok", 60).unwrap();
+        let yaml = build_yaml_from_update(&body, &sample_cfg(), None).unwrap();
         let parsed = Config::from_yaml_str(&yaml).unwrap();
         assert!(!parsed.microwaveprop.unwrap().enabled);
+    }
+
+    /// A local edit must not silently reset the version microwaveprop last
+    /// handed the node, or the next reconnect looks like a node that never
+    /// applied its config.
+    #[test]
+    fn build_yaml_from_update_carries_the_persisted_config_version_forward() {
+        let yaml = build_yaml_from_update(&sample_update(), &sample_cfg(), None).unwrap();
+        let parsed = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(parsed.microwaveprop.unwrap().config_version, 7);
+    }
+
+    #[test]
+    fn build_yaml_from_update_records_a_newly_minted_config_version() {
+        let yaml = build_yaml_from_update(&sample_update(), &sample_cfg(), Some(12)).unwrap();
+        let parsed = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(parsed.microwaveprop.unwrap().config_version, 12);
+    }
+
+    #[test]
+    fn cfg_to_update_round_trips_the_active_config_through_the_writer() {
+        let cfg = sample_cfg();
+        let yaml = build_yaml_from_update(&cfg_to_update(&cfg), &cfg, None).unwrap();
+        let parsed = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(parsed.frequency, cfg.frequency);
+        assert_eq!(parsed.mode, cfg.mode);
+        assert_eq!(parsed.driver, cfg.driver);
+        assert_eq!(parsed.sample_rate, cfg.sample_rate);
+        assert_eq!(parsed.gain, cfg.gain);
+        assert_eq!(parsed.period_seconds, cfg.period_seconds);
+        assert_eq!(parsed.http.bind, cfg.http.bind);
+        assert_eq!(parsed.beacon.unwrap().bandwidth_hz, 300.0);
+        let mw = parsed.microwaveprop.unwrap();
+        assert_eq!(mw.monitor_token, "secret-token");
+        assert_eq!(mw.beacon_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(mw.config_version, 7);
     }
 
     fn measurement(active: f64) -> Measurement {
@@ -1159,6 +1311,8 @@ mod tests {
             uploader_status: Arc::new(RwLock::new(UploaderStatus::default())),
             worker_handle: StdMutex::new(None),
             http_server: StdMutex::new(None),
+            sync_notify: watch::Sender::new(0),
+            config_write: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1420,6 +1574,60 @@ mod tests {
         let bytes = body_bytes(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn persist_config_version_writes_disk_without_restarting_the_worker() {
+        let path = std::env::temp_dir().join(format!(
+            "propmonitor-config-version-{}.yaml",
+            std::process::id()
+        ));
+        let state = test_state(sample_cfg(), path.to_str().unwrap());
+
+        persist_config_version(&state, 12).await.unwrap();
+
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .microwaveprop
+                .as_ref()
+                .unwrap()
+                .config_version,
+            12
+        );
+        let on_disk = Config::from_yaml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mw = on_disk.microwaveprop.unwrap();
+        assert_eq!(mw.config_version, 12);
+        // The rest of the config — token included — survives the rewrite.
+        assert_eq!(mw.monitor_token, "secret-token");
+        assert_eq!(on_disk.frequency, 28_330_000.0);
+        assert_eq!(on_disk.beacon.unwrap().bandwidth_hz, 300.0);
+        // No SDR churn: a version-only update never spawns a worker.
+        assert!(state
+            .worker_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Recording the version we already have must not rewrite config.yaml
+    /// — an unwritable path is the cheapest proof that no write happened.
+    #[tokio::test]
+    async fn persist_config_version_skips_the_write_when_unchanged() {
+        let state = test_state(sample_cfg(), "/nonexistent-dir/propmonitor.yaml");
+        persist_config_version(&state, 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persist_config_version_fails_without_a_microwaveprop_block() {
+        let mut cfg = sample_cfg();
+        cfg.microwaveprop = None;
+        let state = test_state(cfg, "/nonexistent-dir/propmonitor.yaml");
+        assert!(persist_config_version(&state, 3).await.is_err());
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ Exact shape, with realistic values:
   "snr_peak_db":            21.8,
   "snr_avg_db":             21.1,
   "signal_active_fraction": 0.48,
-  "propmonitor_version":    "0.1.0"
+  "propmonitor_version":    "0.2.0"
 }
 ```
 
@@ -71,7 +71,7 @@ Exact shape, with realistic values:
 | `snr_peak_db` | number | yes | typically 0 to 60 | `signal_peak_dbfs − noise_floor_dbfs`. |
 | `snr_avg_db` | number | yes | typically 0 to 60 | `signal_avg_dbfs − noise_floor_dbfs`. |
 | `signal_active_fraction` | number | yes | 0.0 – 1.0 | Fraction of FFT frames in the window where in-band power exceeded `noise_floor + 3 dB`. `1.0` = continuous carrier; `~0.5` = 50%-keyed CW; `0.0` = nothing heard. |
-| `propmonitor_version` | string | yes | semver from `Cargo.toml` | Build version of the client. Currently `0.1.0`. Diagnostic only — helps explain stat-distribution shifts that correlate with client upgrades. |
+| `propmonitor_version` | string | yes | semver from `Cargo.toml` | Build version of the client. Currently `0.2.0`. Diagnostic only — helps explain stat-distribution shifts that correlate with client upgrades. |
 
 All numeric fields are `f64` on the client and serialize as JSON
 numbers; integers serialize without a fractional part (`60` not `60.0`).
