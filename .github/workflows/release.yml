@@ -48,7 +48,7 @@ jobs:
       PROP_BUILD_COMMIT: ${{ github.sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native SoapySDR (x86_64)
         if: ${{ !matrix.cross }}
@@ -93,7 +93,7 @@ jobs:
           cp config.yaml dist/propmonitor-${{ matrix.target }}/ 2>/dev/null || true
           tar czf ${{ matrix.asset }} -C dist propmonitor-${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.asset }}
@@ -105,14 +105,14 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: List artifacts
         run: find artifacts -type f
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*.tar.gz
           generate_release_notes: true
