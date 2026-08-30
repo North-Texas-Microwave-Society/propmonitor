@@ -353,6 +353,7 @@ mod tests {
                 bind: "0.0.0.0:5760".to_string(),
             },
             microwaveprop: None,
+            update: crate::config::UpdateConfig::default(),
         }
     }
 
@@ -646,6 +647,7 @@ mod tests {
                 bind: "0.0.0.0:5760".to_string(),
             },
             microwaveprop: None, // not configured
+            update: crate::config::UpdateConfig::default(),
         }));
         let device_info = Arc::new(RwLock::new(None));
         let (meas_tx, meas_rx) = tokio::sync::broadcast::channel::<WsEvent>(8);
@@ -701,6 +703,7 @@ mod tests {
                 bind: "0.0.0.0:5760".to_string(),
             },
             microwaveprop: None,
+            update: crate::config::UpdateConfig::default(),
         }));
         let device_info = Arc::new(RwLock::new(None));
         let (meas_tx, meas_rx) = tokio::sync::broadcast::channel::<WsEvent>(8);

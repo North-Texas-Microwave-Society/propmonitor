@@ -11,7 +11,7 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 use crate::config::Config;
 use crate::error::Error;
 use crate::store::{MeasurementStore, MAX_ENTRIES};
+use crate::update::{Manifest, Phase, UpdateRequest, UpdateState};
 use crate::uploader::{UploadEvent, UploaderStatus};
 use crate::worker::{run_worker, WorkerEvent};
 
@@ -68,6 +69,14 @@ pub enum WsEvent {
     Error {
         message: String,
     },
+    /// Self-update channel progress. `latest` is the build the channel
+    /// offers when it differs from the running one; `error` is why the
+    /// last check or install failed.
+    Update {
+        phase: Phase,
+        latest: Option<Manifest>,
+        error: Option<String>,
+    },
 }
 
 /// Per-process state shared by all axum handlers.
@@ -100,6 +109,18 @@ pub struct AppState {
     /// build a whole yaml document and write it back — interleaved, one
     /// edit would silently vanish while its version was recorded.
     pub config_write: tokio::sync::Mutex<()>,
+    /// Self-update channel state, shared with the update task and read by
+    /// `GET /api/update`.
+    pub update_state: Arc<RwLock<UpdateState>>,
+    /// Wakes the update task for an explicit "check now" / "install now"
+    /// from the UI. `watch` coalesces, so a burst of clicks is one wake.
+    pub update_notify: watch::Sender<UpdateRequest>,
+    /// Absolute path of the running binary — where a new one is installed.
+    /// Resolved once at boot, before anything can rename it.
+    pub install_path: std::path::PathBuf,
+    /// Release-channel manifest URL. A field rather than a constant so
+    /// tests can point the channel at a local server.
+    pub manifest_url: String,
 }
 
 pub struct WorkerHandle {
@@ -129,6 +150,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/devices", get(get_devices))
         .route("/api/status", get(get_status))
         .route("/api/measurements", get(get_measurements))
+        .route("/api/update", get(get_update))
+        .route("/api/update/check", post(post_update_check))
+        .route("/api/update/install", post(post_update_install))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -248,6 +272,7 @@ struct ConfigView {
     beacon: Option<BeaconView>,
     http: HttpView,
     microwaveprop: Option<MicrowavepropView>,
+    update: UpdateView,
 }
 
 #[derive(Serialize)]
@@ -267,6 +292,13 @@ struct MicrowavepropView {
     monitor_token: String, // always "redacted" on output
     beacon_id: String,
     gridsquare: String,
+}
+
+#[derive(Serialize)]
+struct UpdateView {
+    enabled: bool,
+    auto: bool,
+    check_interval: u32,
 }
 
 fn cfg_to_view(cfg: &Config) -> ConfigView {
@@ -291,6 +323,11 @@ fn cfg_to_view(cfg: &Config) -> ConfigView {
             beacon_id: m.beacon_id.clone(),
             gridsquare: m.gridsquare.clone(),
         }),
+        update: UpdateView {
+            enabled: cfg.update.enabled,
+            auto: cfg.update.auto,
+            check_interval: cfg.update.check_interval,
+        },
     }
 }
 
@@ -311,6 +348,10 @@ pub(crate) struct ConfigUpdate {
     pub(crate) beacon: Option<BeaconUpdate>,
     pub(crate) http: Option<HttpUpdate>,
     pub(crate) microwaveprop: Option<MicrowavepropUpdate>,
+    /// Omitted entirely (an older client, or the sync task) means "leave
+    /// the self-update settings alone" — a config push from microwaveprop
+    /// must never reset a node's update channel.
+    pub(crate) update: Option<UpdateUpdate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +373,20 @@ pub(crate) struct MicrowavepropUpdate {
     pub(crate) beacon_id: String,
     #[serde(default)]
     pub(crate) gridsquare: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UpdateUpdate {
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_true")]
+    pub(crate) auto: bool,
+    #[serde(default = "default_check_interval")]
+    pub(crate) check_interval: u32,
+}
+
+fn default_check_interval() -> u32 {
+    crate::config::DEFAULT_CHECK_INTERVAL
 }
 
 fn default_true() -> bool {
@@ -483,6 +538,11 @@ pub(crate) fn cfg_to_update(cfg: &Config) -> ConfigUpdate {
             beacon_id: m.beacon_id.clone(),
             gridsquare: m.gridsquare.clone(),
         }),
+        update: Some(UpdateUpdate {
+            enabled: cfg.update.enabled,
+            auto: cfg.update.auto,
+            check_interval: cfg.update.check_interval,
+        }),
     }
 }
 
@@ -553,6 +613,23 @@ fn build_yaml_from_update(
         w.nested_string("gridsquare", &m.gridsquare);
         w.nested_scalar("config_version", &version.to_string());
     }
+
+    // The update channel is node-local: microwaveprop never carries it,
+    // so an absent block means "keep what is running" rather than "reset
+    // to defaults".
+    let update = body
+        .update
+        .as_ref()
+        .map(|u| crate::config::UpdateConfig {
+            enabled: u.enabled,
+            auto: u.auto,
+            check_interval: u.check_interval,
+        })
+        .unwrap_or_else(|| current.update.clone());
+    w.nested_open("update");
+    w.nested_scalar("enabled", if update.enabled { "true" } else { "false" });
+    w.nested_scalar("auto", if update.auto { "true" } else { "false" });
+    w.nested_scalar("check_interval", &update.check_interval.to_string());
 
     Ok(w.finish())
 }
@@ -631,6 +708,68 @@ async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "uploader": uploader,
     }))
     .into_response()
+}
+
+/// One JSON snapshot of the self-update channel: the running build, what
+/// the channel last offered, where a new binary would land, and the
+/// operator's three settings. Every update endpoint answers with this
+/// shape so the UI has exactly one thing to render.
+async fn update_snapshot(state: &Arc<AppState>) -> Json<serde_json::Value> {
+    let cfg = state.config.read().await.update.clone();
+    let s = state.update_state.read().await;
+    Json(json!({
+        "enabled": cfg.enabled,
+        "auto": cfg.auto,
+        "check_interval": cfg.check_interval,
+        "current": s.current,
+        "latest": s.latest,
+        "phase": s.phase,
+        "last_check_at": s.last_check_at,
+        "last_error": s.last_error,
+        "install_path": state.install_path.to_string_lossy(),
+    }))
+}
+
+async fn get_update(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    update_snapshot(&state).await.into_response()
+}
+
+/// Ask for a check now. Returns the snapshot as it stands — the check
+/// itself runs on the channel task and reports through `WsEvent::Update`.
+/// Works even with `update.enabled: false`: the flag governs the timer,
+/// not the operator.
+async fn post_update_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.update_notify.send_replace(UpdateRequest::Check);
+    update_snapshot(&state).await.into_response()
+}
+
+/// Install the build the last check found. Rejected — rather than queued —
+/// when there is nothing to install, something is already in flight, or
+/// the platform has no in-place activation, so the UI can say why.
+async fn post_update_install(State(state): State<Arc<AppState>>) -> Response {
+    {
+        let s = state.update_state.read().await;
+        if s.phase.is_busy() {
+            return error_response(
+                StatusCode::CONFLICT,
+                "an update check or install is already running".to_string(),
+            );
+        }
+        if !s.current.can_self_update {
+            return error_response(
+                StatusCode::CONFLICT,
+                "in-place self-update requires a Linux install".to_string(),
+            );
+        }
+        if s.latest.is_none() {
+            return error_response(
+                StatusCode::CONFLICT,
+                "no update available — check for updates first".to_string(),
+            );
+        }
+    }
+    state.update_notify.send_replace(UpdateRequest::Install);
+    update_snapshot(&state).await.into_response()
 }
 
 #[derive(Deserialize)]
@@ -927,6 +1066,7 @@ mod tests {
                 gridsquare: "EM12il".to_string(),
                 config_version: 7,
             }),
+            update: crate::config::UpdateConfig::default(),
         }
     }
 
@@ -997,6 +1137,13 @@ mod tests {
                 monitor_token: "new-token".to_string(),
                 beacon_id: "uuid-xyz".to_string(),
                 gridsquare: "EM12il".to_string(),
+            }),
+            // The UI always sends this block; the `None` path has its own
+            // test.
+            update: Some(UpdateUpdate {
+                enabled: true,
+                auto: false,
+                check_interval: 1800,
             }),
         }
     }
@@ -1301,6 +1448,17 @@ mod tests {
     /// SDR. The store, last-raw, and device-info fields can be seeded
     /// before the call to drive the read-only handlers.
     fn test_state(cfg: Config, config_path: &str) -> Arc<AppState> {
+        test_state_with_channel(cfg, config_path, crate::update::MANIFEST_URL)
+    }
+
+    /// `test_state`, with the release channel pointed somewhere else — a
+    /// local test server, so a check can be driven end to end without
+    /// touching GitHub.
+    fn test_state_with_channel(
+        cfg: Config,
+        config_path: &str,
+        manifest_url: &str,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             config_path: config_path.to_string(),
             config: Arc::new(RwLock::new(cfg)),
@@ -1313,6 +1471,10 @@ mod tests {
             http_server: StdMutex::new(None),
             sync_notify: watch::Sender::new(0),
             config_write: tokio::sync::Mutex::new(()),
+            update_state: Arc::new(RwLock::new(UpdateState::new())),
+            update_notify: watch::Sender::new(UpdateRequest::Idle),
+            install_path: std::env::temp_dir().join("propmonitor-test-binary"),
+            manifest_url: manifest_url.to_string(),
         })
     }
 
@@ -1694,5 +1856,260 @@ mod tests {
         h.stop_and_join();
         // Calling it again must not panic.
         h.stop_and_join();
+    }
+
+    // ---------------- self-update surface -----------------------------
+
+    /// Stands in for the release channel: serves one manifest at
+    /// `/manifest`. Returns the URL to point `AppState::manifest_url` at.
+    async fn fake_channel(manifest: serde_json::Value) -> String {
+        let body = manifest.to_string();
+        let app = Router::new().route(
+            "/manifest",
+            get(move || {
+                let body = body.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/manifest")
+    }
+
+    async fn get_json(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = build_router(state)
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = body_bytes(resp).await;
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post_json(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = body_bytes(resp).await;
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn get_api_update_reports_the_running_build_and_settings() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        let (status, v) = get_json(state, "/api/update").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["current"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["current"]["commit"], crate::update::CURRENT_COMMIT);
+        assert_eq!(v["phase"], "idle");
+        assert!(v["latest"].is_null(), "nothing checked yet");
+        assert!(v["last_check_at"].is_null());
+        assert!(v["last_error"].is_null());
+        // The settings the UI renders its form from.
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["auto"], true);
+        assert_eq!(v["check_interval"], 3600);
+        assert!(
+            v["install_path"].as_str().is_some_and(|p| !p.is_empty()),
+            "the UI shows where a new binary lands"
+        );
+    }
+
+    /// The whole check path, driven through the endpoint the UI calls:
+    /// POST wakes the channel task, the task fetches the manifest from a
+    /// local stand-in, and the result shows up on GET.
+    #[tokio::test]
+    async fn post_api_update_check_records_an_available_build() {
+        let url = fake_channel(serde_json::json!({
+            "version": "9.9.9",
+            "commit": "1111111111111111111111111111111111111111",
+            "built_at": "2026-08-30T12:00:00Z",
+            "assets": { "propmonitor-x86_64-linux": "abc123" },
+        }))
+        .await;
+        let state = test_state_with_channel(sample_cfg(), "config.yaml", &url);
+        let task = tokio::spawn(crate::update::run(state.clone()));
+
+        let (status, _) = post_json(state.clone(), "/api/update/check").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let latest = loop {
+            let (_, v) = get_json(state.clone(), "/api/update").await;
+            if !v["latest"].is_null() {
+                break v;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the check never completed: {v}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(latest["latest"]["version"], "9.9.9");
+        assert_eq!(
+            latest["latest"]["commit"],
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(latest["phase"], "idle", "the check finished");
+        assert!(latest["last_check_at"].is_string());
+        assert!(latest["last_error"].is_null());
+
+        task.abort();
+    }
+
+    /// A manifest describing the build we are already running means "up to
+    /// date", not "update available".
+    #[tokio::test]
+    async fn a_check_against_our_own_commit_reports_up_to_date() {
+        let url = fake_channel(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": crate::update::CURRENT_COMMIT,
+            "built_at": "2026-08-30T12:00:00Z",
+            "assets": { "propmonitor-x86_64-linux": "abc123" },
+        }))
+        .await;
+        let state = test_state_with_channel(sample_cfg(), "config.yaml", &url);
+        let task = tokio::spawn(crate::update::run(state.clone()));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (_, v) = get_json(state.clone(), "/api/update").await;
+            if v["last_check_at"].is_string() {
+                assert!(v["latest"].is_null(), "already current: {v}");
+                assert!(v["last_error"].is_null());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no check ran: {v}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        task.abort();
+    }
+
+    /// An unreachable channel is reported, not fatal — and the next check
+    /// is still allowed to run.
+    #[tokio::test]
+    async fn a_failed_check_surfaces_an_error_and_stays_idle() {
+        // Port 1 on loopback: refused immediately, no waiting.
+        let state = test_state_with_channel(sample_cfg(), "config.yaml", "http://127.0.0.1:1/x");
+        let task = tokio::spawn(crate::update::run(state.clone()));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, v) = get_json(state.clone(), "/api/update").await;
+            if let Some(err) = v["last_error"].as_str() {
+                assert!(err.contains("release channel"), "unexpected error: {err}");
+                assert_eq!(v["phase"], "idle");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no failure seen: {v}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn post_api_update_install_refuses_when_there_is_nothing_to_install() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        let (status, v) = post_json(state, "/api/update/install").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err = v["error"].as_str().unwrap();
+        // Off-Linux the platform check answers first; either way the UI
+        // gets a reason rather than a silent no-op.
+        assert!(
+            err.contains("no update available") || err.contains("requires a Linux install"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_api_update_install_refuses_while_a_check_is_running() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        state.update_state.write().await.phase = crate::update::Phase::Downloading;
+        let (status, v) = post_json(state, "/api/update/install").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(v["error"].as_str().unwrap().contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn ws_update_events_reach_open_clients() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        let mut rx = state.broadcaster.subscribe();
+        state
+            .broadcaster
+            .send(WsEvent::Update {
+                phase: crate::update::Phase::Checking,
+                latest: None,
+                error: None,
+            })
+            .unwrap();
+
+        let got = rx.try_recv().unwrap();
+        let json = serde_json::to_value(&got).unwrap();
+        assert_eq!(json["type"], "update");
+        assert_eq!(json["phase"], "checking");
+        assert!(json["latest"].is_null());
+    }
+
+    #[test]
+    fn cfg_to_view_exposes_the_update_settings() {
+        let mut cfg = sample_cfg();
+        cfg.update = crate::config::UpdateConfig {
+            enabled: false,
+            auto: false,
+            check_interval: 7200,
+        };
+        let v = serde_json::to_value(cfg_to_view(&cfg)).unwrap();
+        assert_eq!(v["update"]["enabled"], false);
+        assert_eq!(v["update"]["auto"], false);
+        assert_eq!(v["update"]["check_interval"], 7200);
+    }
+
+    #[test]
+    fn build_yaml_from_update_writes_the_update_block() {
+        let yaml = build_yaml_from_update(&sample_update(), &sample_cfg(), None).unwrap();
+        let parsed = Config::from_yaml_str(&yaml).unwrap();
+        // sample_update() asks for auto: false, 1800 s.
+        assert!(parsed.update.enabled);
+        assert!(!parsed.update.auto);
+        assert_eq!(parsed.update.check_interval, 1800);
+    }
+
+    /// A body without an `update` block — the sync task's shape — must
+    /// leave the node's own update settings exactly as they were.
+    #[test]
+    fn build_yaml_from_update_preserves_update_settings_when_absent() {
+        let mut current = sample_cfg();
+        current.update = crate::config::UpdateConfig {
+            enabled: true,
+            auto: false,
+            check_interval: 900,
+        };
+        let mut body = sample_update();
+        body.update = None;
+
+        let yaml = build_yaml_from_update(&body, &current, None).unwrap();
+        let parsed = Config::from_yaml_str(&yaml).unwrap();
+        assert_eq!(parsed.update, current.update);
     }
 }

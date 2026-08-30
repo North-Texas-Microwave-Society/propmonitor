@@ -48,6 +48,18 @@ push-mirrors to the public GitHub repo. Consequences:
 
 ## Releasing
 
+Two channels, and the first one is a deployment:
+
+**Push to `main` → the rolling channel.** `.github/workflows/latest.yml`
+builds all three Linux targets and republishes the `latest` GitHub Release
+(raw binaries + tarballs + `propmonitor-manifest.json`). Deployed nodes
+poll that release and install it themselves, by default within the hour, so
+**a push to `main` ships to every node**. `install.sh` resolves "latest
+release" to the same build, so a fresh install and a self-updated node run
+identical binaries. Run the checks before pushing, not after.
+
+**Push a tag → an archival release.**
+
 ```bash
 cargo clippy --all-targets -- -D warnings && cargo test && cargo build --release
 git tag vX.Y.Z && git push origin vX.Y.Z
@@ -59,10 +71,24 @@ armv7 Linux binaries (aarch64/armv7 through `cross` using the images in
 `docker/`) and attaches them to a GitHub Release. The tagged commit
 should be the tip of `main`.
 
-Don't force-move a published tag; cut the next version instead —
-`install.sh` resolves the latest release, and re-pointing a tag makes
-already-installed boxes disagree about what they're running. Keep the tag
-in step with `version` in `Cargo.toml`.
+Both workflows set `PROP_BUILD_COMMIT`; `build.rs` bakes it in as the
+update identity and as the "official build" flag that gates unattended
+updates. `Cross.toml` passes it into the cross containers — drop that and
+cross-built binaries silently become `dev` builds that never auto-update.
+
+The `latest` tag is cosmetic and may flap. The workflow points it at each
+pushed commit through the GitHub refs API so the release page shows real
+contents, but the Forgejo→GitHub push mirror prunes refs it doesn't have,
+so a tag created by CI can vanish until the next push recreates it. The
+channel is addressed by the *release*, never the tag; the publish job's
+last step curls the manifest URL nodes actually poll and fails if it isn't
+serving the new commit, so a broken channel is a red build rather than a
+field problem.
+
+Don't force-move a published *version* tag; cut the next version instead.
+Keep version tags in step with `version` in `Cargo.toml` — the manifest
+reports that value, so a stale `Cargo.toml` mislabels every node's build in
+the UI (the update decision itself uses the commit, so it stays correct).
 
 The release runners are Ubuntu 24.04, so published binaries need glibc
 2.38. That floor is what README's support table promises; lowering it
@@ -99,6 +125,16 @@ One process owns the SDR (single-instance). Inside the process:
   exists, woken by `AppState::sync_notify`, so a self-service install
   never talks to the endpoint and pasting a token in the LAN UI starts
   sync without a restart.
+- **`src/update.rs`** — Self-update channel (`api.md` §6). Long-running
+  tokio task: GETs the fixed `latest`-release manifest, compares the
+  manifest commit against `PROP_BUILD_COMMIT` baked in by `build.rs`, and
+  on a difference downloads the arch asset next to the running binary,
+  verifies its SHA-256, preflights it (config-load probe, same as
+  `install.sh`), keeps the old one as `propmonitor.prev`, renames the new
+  one into place, and `execve`s it. Same PID, so systemd sees no restart.
+  Woken early by `AppState::update_notify` for the UI's check/install
+  buttons. Guards worth keeping: SHA mismatch aborts, unattended installs
+  require an official build, and non-Linux refuses outright.
 - **`src/measure.rs`** — `SpectrumAnalyzer`: Hann-windowed FFT,
   fftshift on the fly, in-band peak + average tracking, median-of-out-
   of-passband noise floor with a guard region. `start_window(offset_hz,
@@ -120,7 +156,8 @@ One process owns the SDR (single-instance). Inside the process:
   match on variants; keep new failures as formatted context strings.
 - **`src/web/`** — Embedded HTML/CSS/JS (single page, no build step).
   Canvas waterfall, settings form bound to `/api/config`, live dBFS +
-  measurement readouts, upload-status line.
+  measurement readouts, upload-status line, update status + check/install
+  buttons bound to `/api/update`.
 - **`src/bin/sdr_diag.rs`** — Standalone diagnostic CLI. Useful when
   the waterfall in the web UI looks wrong and you want to rule out the
   DSP/server path.
@@ -163,14 +200,22 @@ would be, and one of them is bash. A new field usually means all of:
    know the field list by hand. A field the installer doesn't know is a
    field first-run setup silently can't configure.
 7. `api.md` §3 (and §5 if synced), plus README's config sample.
+8. `api.md` §1's `GET /api/config` example, if the field is in `ConfigView`.
 
 ## Deployed layout
 
-`install.sh` puts the binary at `/usr/local/bin/propmonitor` (plus
-`sdr_diag`), config at `/etc/propmonitor/config.yaml` owned by a system
-user with mode 2770, and a hardened `propmonitor.service` systemd unit
-whose only `ReadWritePaths` is the config dir. Anything the daemon needs
-to write outside `/etc/propmonitor` has to be added to the unit.
+`install.sh` puts the daemon at `/opt/propmonitor/bin/propmonitor`, **owned
+by the `propmonitor` service user** — self-update is a rename inside that
+directory, which needs write on the directory, so it cannot live in root's
+`/usr/local/bin` (that's where `sdr_diag` stays). Config is
+`/etc/propmonitor/config.yaml`, owned by a system user with mode 2770. The
+hardened `propmonitor.service` unit lists exactly two `ReadWritePaths`: the
+config dir and the binary dir. Anything else the daemon needs to write has
+to be added there.
+
+A re-run of the installer removes a stale `/usr/local/bin/propmonitor` from
+a pre-self-update install, so a box doesn't end up with two binaries and a
+unit pointing at one of them.
 
 ## Dependencies
 
@@ -180,12 +225,19 @@ it would break the `cross` builds for aarch64/armv7. `tokio-tungstenite`
 is pinned to 0.29 so the sync client shares one tungstenite copy with
 axum's `ws` feature.
 
+`sha2` is pure Rust on purpose (self-update asset verification): a C
+hashing library would reintroduce the cross-compilation problem rustls
+exists to avoid. Hex formatting is a six-line local helper rather than the
+`hex` crate.
+
 ## Persistent vs ephemeral
 
 - **Persistent:** `config.yaml`. Written atomically by `PUT /api/config`
-  (tmp + fsync + rename).
+  (tmp + fsync + rename). The installed binary itself, plus one generation
+  of backup (`propmonitor.prev`), courtesy of self-update.
 - **Ephemeral:** measurement history, retry queue, raw dBFS, device
-  info. All in-memory. Restarts reset them.
+  info, and update-channel state (`latest`, `last_check_at`). All
+  in-memory; a restart re-checks the channel immediately.
 
 ## When editing
 
@@ -225,3 +277,13 @@ axum's `ws` feature.
 - Linux-only by design: the deployment target is a headless Debian /
   Raspberry Pi OS box running the systemd unit from `install.sh`. CI
   builds x86_64, aarch64 and armv7 Linux only.
+- Self-update invariants worth not breaking: the SHA-256 check is the one
+  hard gate (mismatch aborts, running binary untouched); `execve` keeps the
+  PID so systemd never sees a restart; the previous binary stays as
+  `propmonitor.prev` for rollback; assets resolve relative to the manifest
+  URL so one setting moves a node to a fork's channel; and unattended
+  installs require `PROP_BUILD_COMMIT` to have been set at build time, which
+  is what stops a laptop build from replacing itself with a release binary.
+- The `update` block never enters `sync::SyncConfig`. When a node is
+  managed, the website still must not decide when it reboots itself;
+  `to_config_update` sends `update: None`, which means "keep local values".

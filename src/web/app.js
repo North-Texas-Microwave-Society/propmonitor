@@ -134,6 +134,96 @@ function setUploadStatus(ev) {
   $("ro-upload").textContent = `uploader: ${ev.status} at ${ev.at} · queue ${ev.queued}`;
 }
 
+// Last /api/update snapshot. WebSocket `update` frames patch the volatile
+// fields onto it; everything else (the running build, the install path)
+// only changes when the daemon restarts.
+let updateInfo = null;
+
+function shortCommit(sha) {
+  if (!sha) return "unknown";
+  return sha === "dev" ? "dev" : sha.slice(0, 7);
+}
+
+function buildLabel(b) {
+  return `${b.version} (${shortCommit(b.commit)})`;
+}
+
+function renderUpdate() {
+  const u = updateInfo;
+  if (!u) return;
+  const running = buildLabel(u.current);
+  let text;
+  switch (u.phase) {
+    case "checking":
+      text = "checking the release channel…";
+      break;
+    case "downloading":
+      text = `downloading ${u.latest ? buildLabel(u.latest) : "the new build"}…`;
+      break;
+    case "installing":
+      text = "installing — the daemon restarts itself in a moment";
+      break;
+    default:
+      if (u.last_error) {
+        text = `update: ${u.last_error}`;
+      } else if (u.latest) {
+        text = `update available: ${buildLabel(u.latest)} · running ${running}`;
+        if (!u.current.can_self_update) {
+          text += " · self-update needs a Linux install";
+        } else if (!u.auto || !u.current.dist_build) {
+          text += " · press Install";
+        }
+      } else if (u.last_check_at) {
+        text = `up to date: ${running} · checked ${u.last_check_at}`;
+      } else {
+        text = `running ${running}`;
+      }
+  }
+  $("ro-update").textContent = text;
+  $("ro-update").className = u.last_error ? "err" : "muted";
+
+  const busy = u.phase !== "idle";
+  $("btn-check").disabled = busy;
+  $("btn-install").disabled = busy || !u.latest || !u.current.can_self_update;
+}
+
+async function loadUpdate() {
+  try {
+    const r = await fetch("/api/update");
+    if (r.ok) {
+      updateInfo = await r.json();
+      renderUpdate();
+    }
+  } catch (e) {}
+}
+
+// The channel task pushes every transition, so an install started from
+// another browser tab (or by the timer) shows up here too.
+function applyUpdateEvent(ev) {
+  if (!updateInfo) return;
+  updateInfo.phase = ev.phase;
+  updateInfo.latest = ev.latest;
+  updateInfo.last_error = ev.error;
+  renderUpdate();
+}
+
+async function requestUpdate(path) {
+  try {
+    const r = await fetch(path, { method: "POST" });
+    const body = await r.json();
+    if (r.ok) {
+      updateInfo = body;
+      renderUpdate();
+    } else {
+      $("ro-update").textContent = `update: ${body.error || "request failed"}`;
+      $("ro-update").className = "err";
+    }
+  } catch (e) {
+    $("ro-update").textContent = "update: the daemon did not answer";
+    $("ro-update").className = "err";
+  }
+}
+
 let ws = null;
 function connectWS() {
   const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
@@ -154,6 +244,7 @@ function connectWS() {
       case "waterfall":   scrollAndDrawRow(ev.bins, ev.f0_hz, ev.bin_hz); break;
       case "measurement": setReadout(ev); break;
       case "upload":      setUploadStatus(ev); break;
+      case "update":      applyUpdateEvent(ev); break;
       case "period_started": break;
       case "error":       $("hdr-summary").textContent = "error: " + ev.message; break;
     }
@@ -224,6 +315,14 @@ async function loadConfig() {
   } else {
     $("settings-form").mw_enabled.checked = false;
   }
+  const up = cfg.update || {};
+  $("settings-form").up_enabled.checked = up.enabled !== false;
+  $("settings-form").up_auto.checked = up.auto !== false;
+  // Stored in seconds, shown in minutes: an hour is the useful unit here.
+  $("settings-form").up_interval.value = Math.max(
+    1,
+    Math.round((up.check_interval || 3600) / 60),
+  );
 }
 
 function setSaveStatus(text, cls) {
@@ -260,6 +359,16 @@ async function saveConfig(ev) {
       gridsquare,
     };
   }
+  // Always sent: an omitted block means "keep what is running", which
+  // would silently discard whatever the operator just ticked.
+  body.update = {
+    enabled: f.up_enabled.checked,
+    auto: f.up_auto.checked,
+    check_interval: Math.max(
+      60,
+      Math.round(parseFloat(f.up_interval.value || "60") * 60),
+    ),
+  };
   setSaveStatus("saving…");
   const r = await fetch("/api/config", {
     method: "PUT",
@@ -282,8 +391,17 @@ async function saveConfig(ev) {
 function main() {
   initCanvas();
   loadConfig();
+  loadUpdate();
   $("settings-form").addEventListener("submit", saveConfig);
   $("refresh-devices").addEventListener("click", () => loadDevices());
+  $("btn-check").addEventListener("click", () => requestUpdate("/api/update/check"));
+  $("btn-install").addEventListener("click", () => {
+    const target = updateInfo && updateInfo.latest ? buildLabel(updateInfo.latest) : "the new build";
+    if (!confirm(`Install ${target}? The daemon restarts itself in place — the SDR reopens and live history resets.`)) {
+      return;
+    }
+    requestUpdate("/api/update/install");
+  });
   connectWS();
 }
 

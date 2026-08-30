@@ -41,6 +41,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    env:
+      # Same identity the rolling channel bakes in (see latest.yml), so a
+      # node installed from a tagged release is a release build too and can
+      # self-update from main.
+      PROP_BUILD_COMMIT: ${{ github.sha }}
+
     steps:
       - uses: actions/checkout@v4
 

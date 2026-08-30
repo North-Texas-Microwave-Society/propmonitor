@@ -5,6 +5,7 @@ mod server;
 mod store;
 mod sync;
 mod timefmt;
+mod update;
 mod uploader;
 mod worker;
 mod yaml;
@@ -81,6 +82,18 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
         http_server: StdMutex::new(None),
         sync_notify: tokio::sync::watch::Sender::new(0),
         config_write: tokio::sync::Mutex::new(()),
+        update_state: Arc::new(RwLock::new(crate::update::UpdateState::new())),
+        update_notify: tokio::sync::watch::Sender::new(crate::update::UpdateRequest::Idle),
+        // Resolved now, while the binary is certainly still where it was
+        // exec'd from: a later self-update renames that path.
+        install_path: crate::update::resolve_install_path(),
+        // Overridable so a fork can run its own channel (and so the
+        // update path can be exercised against a local server) without a
+        // rebuild. Unset on every normal install.
+        manifest_url: std::env::var("PROPMONITOR_MANIFEST_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| crate::update::MANIFEST_URL.to_string()),
     });
 
     {
@@ -113,6 +126,16 @@ async fn boot(cfg: Config, config_path: String) -> Result<Arc<AppState>> {
         let state_for_sync = state.clone();
         tokio::spawn(async move {
             crate::sync::run(state_for_sync).await;
+        });
+    }
+
+    // Self-update channel. Polls the release channel, installs new builds
+    // and re-executes in place; `update.enabled` / `update.auto` in
+    // config.yaml decide how much of that happens unattended.
+    {
+        let state_for_update = state.clone();
+        tokio::spawn(async move {
+            crate::update::run(state_for_update).await;
         });
     }
 

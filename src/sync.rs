@@ -225,7 +225,8 @@ impl SyncConfig {
 
     /// Build the local update that applies this config, preserving
     /// everything sync deliberately doesn't carry: the `monitor_token` (via
-    /// the existing `"redacted"` sentinel) and the whole `http` block.
+    /// the existing `"redacted"` sentinel), the whole `http` block, and the
+    /// self-update settings.
     pub(crate) fn to_config_update(&self, current: &Config) -> ConfigUpdate {
         ConfigUpdate {
             frequency: self.frequency,
@@ -248,6 +249,9 @@ impl SyncConfig {
                 beacon_id: self.beacon_id.clone(),
                 gridsquare: self.gridsquare.clone(),
             }),
+            // Node-local: `None` means "keep the running values". The
+            // website has no say in when a node updates itself.
+            update: None,
         }
     }
 }
@@ -802,6 +806,7 @@ mod tests {
                 gridsquare: "EM12il".to_string(),
                 config_version: 7,
             }),
+            update: crate::config::UpdateConfig::default(),
         }
     }
 
@@ -1137,6 +1142,10 @@ mod tests {
             http_server: StdMutex::new(None),
             sync_notify: watch::Sender::new(0),
             config_write: tokio::sync::Mutex::new(()),
+            update_state: Arc::new(RwLock::new(crate::update::UpdateState::new())),
+            update_notify: watch::Sender::new(crate::update::UpdateRequest::Idle),
+            install_path: std::env::temp_dir().join("propmonitor-test-binary"),
+            manifest_url: crate::update::MANIFEST_URL.to_string(),
         })
     }
 

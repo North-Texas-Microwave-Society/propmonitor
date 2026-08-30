@@ -29,7 +29,12 @@ GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
 
 SERVICE_NAME="propmonitor"
-INSTALL_DIR="/usr/local/bin"
+# The daemon replaces this binary in place when it self-updates, so it has
+# to live somewhere the (unprivileged) service user owns — a rename inside
+# the directory needs write on the DIRECTORY, and /usr/local/bin is root's.
+# Diagnostics stay in /usr/local/bin: root-owned, never self-updated.
+INSTALL_DIR="/opt/propmonitor/bin"
+TOOLS_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/propmonitor"
 SERVICE_USER="propmonitor"
 BLACKLIST_FILE="/etc/modprobe.d/propmonitor-rtlsdr.conf"
@@ -374,38 +379,59 @@ for mod in dvb_usb_rtl28xxu rtl2832_sdr rtl2832 rtl2830; do
 done
 
 # ---------------------------------------------------------------------------
-# Download latest release
+# Download the binary
+#
+# The daemon self-updates from the `latest` release — the rolling build of
+# main (see api.md §6) — so the installer takes its binary from there too.
+# A fresh install and a node that has been running for months then hold the
+# same build, instead of the installer seeding an older tagged release that
+# the daemon replaces an hour later.
+#
+# The `latest` tag is fixed, so the common path needs no API call at all,
+# which also keeps a NAT full of nodes off api.github.com's unauthenticated
+# rate limit. The API is only consulted if that download is unavailable.
 # ---------------------------------------------------------------------------
 step "Downloading propmonitor binary"
 
-# Parsed with sed rather than python3/jq: neither is guaranteed on a minimal
-# Debian install, and pulling in an interpreter just to read one string is
-# not worth it. GitHub returns pretty-printed JSON, one key per line.
-LATEST_TAG=$(curl -fsSL --retry 3 --retry-delay 2 \
-                  -H 'Accept: application/vnd.github+json' \
-                  "${GITHUB_API}/releases/latest" 2>/dev/null |
-             sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-             head -n1 || true)
-
-if [[ -z "$LATEST_TAG" ]]; then
-    die "Could not find a published release at ${GITHUB_API}/releases/latest.
-  Either the repository has no release yet, or this machine cannot reach
-  api.github.com. To build from source instead, see:
-      https://github.com/${REPO}#local-development"
-fi
-
-info "Latest release: ${BLD}${LATEST_TAG}${RST}"
-
 TARBALL="${ASSET}.tar.gz"
-DOWNLOAD_URL="${GITHUB_DL}/${LATEST_TAG}/${TARBALL}"
 
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
-info "Downloading ${TARBALL}..."
-curl -fsSL --retry 3 --retry-delay 2 -o "${WORKDIR}/${TARBALL}" "$DOWNLOAD_URL" ||
-    die "Failed to download ${DOWNLOAD_URL}
-  Check that release ${LATEST_TAG} has a ${TARBALL} asset attached."
+download_tarball() {
+    curl -fsSL --retry 3 --retry-delay 2 -o "${WORKDIR}/${TARBALL}" "$1" 2>/dev/null
+}
+
+RELEASE_TAG="latest"
+info "Downloading ${TARBALL} from the ${BLD}latest${RST} channel..."
+if ! download_tarball "${GITHUB_DL}/latest/${TARBALL}"; then
+    warn "The rolling 'latest' release has no ${TARBALL} yet; trying the newest tagged release."
+
+    # Parsed with sed rather than python3/jq: neither is guaranteed on a
+    # minimal Debian install, and pulling in an interpreter just to read one
+    # string is not worth it. GitHub returns pretty-printed JSON, one key
+    # per line.
+    RELEASE_TAG=$(curl -fsSL --retry 3 --retry-delay 2 \
+                       -H 'Accept: application/vnd.github+json' \
+                       "${GITHUB_API}/releases/latest" 2>/dev/null |
+                  sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+                  head -n1 || true)
+
+    if [[ -z "$RELEASE_TAG" ]]; then
+        die "Could not find a release to install from.
+  Tried ${GITHUB_DL}/latest/${TARBALL} and ${GITHUB_API}/releases/latest.
+  Either the repository has no release yet, or this machine cannot reach
+  GitHub. To build from source instead, see:
+      https://github.com/${REPO}#local-development"
+    fi
+
+    info "Newest tagged release: ${BLD}${RELEASE_TAG}${RST}"
+    download_tarball "${GITHUB_DL}/${RELEASE_TAG}/${TARBALL}" ||
+        die "Failed to download ${GITHUB_DL}/${RELEASE_TAG}/${TARBALL}
+  Check that release ${RELEASE_TAG} has a ${TARBALL} asset attached."
+fi
+
+info "Installing from release '${RELEASE_TAG}'."
 
 info "Extracting..."
 mkdir -p "${WORKDIR}/extract"
@@ -421,8 +447,19 @@ BIN_PROPMONITOR=$(find_payload propmonitor)
 [[ -n "$BIN_PROPMONITOR" ]] ||
     die "Binary 'propmonitor' not found inside ${TARBALL}."
 
+install -d -m 755 "$INSTALL_DIR"
 install -m 755 "$BIN_PROPMONITOR" "${INSTALL_DIR}/propmonitor"
 info "Installed propmonitor → ${INSTALL_DIR}/propmonitor"
+
+# Older installs put the daemon in /usr/local/bin, where it cannot replace
+# itself. The unit written below points at the new path, so the old copy is
+# dead weight — and leaving two binaries around invites running the wrong
+# one by hand. Removing it while the old daemon is still running is safe:
+# the kernel keeps the open inode alive until the restart at the end.
+if [[ "$INSTALL_DIR" != "$TOOLS_DIR" && -f "${TOOLS_DIR}/propmonitor" ]]; then
+    rm -f "${TOOLS_DIR}/propmonitor"
+    info "Removed the superseded ${TOOLS_DIR}/propmonitor"
+fi
 
 # Dynamic-linker smoke test, run before anything depends on the binary.
 #
@@ -453,8 +490,8 @@ esac
 
 BIN_SDR_DIAG=$(find_payload sdr_diag)
 if [[ -n "$BIN_SDR_DIAG" ]]; then
-    install -m 755 "$BIN_SDR_DIAG" "${INSTALL_DIR}/sdr_diag"
-    info "Installed sdr_diag → ${INSTALL_DIR}/sdr_diag"
+    install -m 755 "$BIN_SDR_DIAG" "${TOOLS_DIR}/sdr_diag"
+    info "Installed sdr_diag → ${TOOLS_DIR}/sdr_diag"
 fi
 
 # ---------------------------------------------------------------------------
@@ -470,6 +507,15 @@ else
             --comment "propmonitor SDR monitor" "${SERVICE_USER}"
     info "Created system user '${SERVICE_USER}'."
 fi
+
+# Self-update is a rename inside this directory, then an execve of the new
+# path: the service user needs write on the directory (for the temp file,
+# the .prev backup and the rename) and on the binary itself. Nothing else
+# under /opt/propmonitor is writable, and the unit's ReadWritePaths below
+# narrows it further.
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR"
+chmod 755 "$INSTALL_DIR"
+info "Handed ${INSTALL_DIR} to '${SERVICE_USER}' for in-place updates."
 
 # librtlsdr's udev rule grants MODE=0660 GROUP=plugdev on the dongle, so
 # membership of plugdev is what lets a non-root daemon open it. `plugdev` is
@@ -532,6 +578,11 @@ beacon:                        # used when mode == beacon
 
 http:
   bind: "0.0.0.0:5760"         # LAN-accessible on port 5760
+
+update:                        # self-update from the GitHub release channel
+  enabled: true                # watch for new builds of main
+  auto: true                   # install them and restart in place
+  check_interval: 3600         # seconds between checks, minimum 60
 
 # Uploads to prop.w5isp.com. All three fields are required.
 # microwaveprop:
@@ -670,9 +721,14 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-# config.yaml is rewritten in place when settings are saved from the
-# web UI, so this one path stays writable under ProtectSystem=strict.
-ReadWritePaths=${CONFIG_DIR}
+# Two writable paths under ProtectSystem=strict:
+#   - ${CONFIG_DIR}: config.yaml is rewritten when settings are saved
+#     from the web UI (and when microwaveprop pushes a config).
+#   - ${INSTALL_DIR}: self-update downloads the new binary here, keeps the
+#     old one as propmonitor.prev, and renames the new one into place.
+#     NoNewPrivileges + the plain service user still apply, so this grants
+#     the daemon nothing beyond replacing its own executable.
+ReadWritePaths=${CONFIG_DIR} ${INSTALL_DIR}
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -734,6 +790,11 @@ echo "  Binary    : ${INSTALL_DIR}/propmonitor"
 echo "  Config    : ${CONFIG}"
 echo "  Web UI    : http://${IP}:${PORT}"
 echo
+echo "  Updates   : on. This node follows the ${BLD}main${RST} branch: it checks"
+echo "              hourly, installs new builds and restarts itself in place."
+echo "              Turn it off in the web UI (Settings → software updates)"
+echo "              or set 'update.auto: false' in ${CONFIG}."
+echo
 
 if (( HEALTHY )); then
     echo "  ${GRN}Service is running and answering on port ${PORT}.${RST}"
@@ -756,6 +817,7 @@ echo "    Re-run setup    : sudo bash install.sh"
 echo "    List SDR devices: SoapySDRUtil --find"
 echo "    Test the dongle : rtl_test -t"
 echo "    Status          : systemctl status ${SERVICE_NAME}"
+echo "    Roll back update: sudo -u ${SERVICE_USER} mv ${INSTALL_DIR}/propmonitor.prev ${INSTALL_DIR}/propmonitor && sudo systemctl restart ${SERVICE_NAME}"
 echo
 
 if (( ! HEALTHY )); then

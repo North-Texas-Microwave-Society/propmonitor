@@ -19,3 +19,8 @@ http:
 #   gridsquare: ""               # Maidenhead grid square of receiver (e.g. "FN31pr")
 #   monitor_token: "your-monitor-token-here"
 #   beacon_id: "your-beacon-uuid-here"
+
+update:
+  enabled: true                # watch the GitHub release channel
+  auto: true                   # install new builds and restart in place
+  check_interval: 3600         # seconds, minimum 60

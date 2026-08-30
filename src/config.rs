@@ -96,6 +96,37 @@ pub struct MicrowavepropConfig {
     pub config_version: u64,
 }
 
+/// Default seconds between release-channel checks.
+pub const DEFAULT_CHECK_INTERVAL: u32 = 3600;
+
+/// Floor on `update.check_interval`. Keeps a fleet of nodes off the
+/// release endpoint no matter what gets typed into the UI.
+pub const MIN_CHECK_INTERVAL: u32 = 60;
+
+/// Self-update channel (`update:` block). `src/update.rs` has the
+/// mechanics; these are the three knobs an operator gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateConfig {
+    /// Whether the daemon polls the release channel on a timer. An
+    /// explicit "check now" from the web UI runs either way.
+    pub enabled: bool,
+    /// Whether a newer build is installed and activated without waiting
+    /// for an operator. Never acts on a locally built binary.
+    pub auto: bool,
+    /// Seconds between automatic checks; floored at `MIN_CHECK_INTERVAL`.
+    pub check_interval: u32,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto: true,
+            check_interval: DEFAULT_CHECK_INTERVAL,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub frequency: f64,
@@ -111,6 +142,9 @@ pub struct Config {
     pub beacon: Option<BeaconConfig>,
     pub http: HttpConfig,
     pub microwaveprop: Option<MicrowavepropConfig>,
+    /// Self-update channel. Always present: an absent `update:` block
+    /// means "every default", not "off".
+    pub update: UpdateConfig,
 }
 
 impl Config {
@@ -281,6 +315,47 @@ impl Config {
             None => None,
         };
 
+        // An absent block means "all defaults" — the channel is on out of
+        // the box. An unattended monitor that can never pick up a fix is
+        // the failure mode worth avoiding.
+        let update = match map.get("update") {
+            Some(v) => {
+                let m = v
+                    .as_map()
+                    .ok_or_else(|| Error::msg("config: `update` must be a mapping"))?;
+                let flag = |key: &str, default: bool| -> Result<bool> {
+                    match m.get(key) {
+                        Some(v) => v
+                            .as_scalar()
+                            .ok_or_else(|| {
+                                Error::msg(format!("config: `update.{key}` must be a scalar"))
+                            })?
+                            .parse::<bool>()
+                            .map_err(|_| {
+                                Error::msg(format!("config: `update.{key}` must be true or false"))
+                            }),
+                        None => Ok(default),
+                    }
+                };
+                let check_interval = match m.get("check_interval") {
+                    Some(v) => u32::try_from(yaml::parse_usize(
+                        v.as_scalar().ok_or_else(|| {
+                            Error::msg("config: `update.check_interval` must be a scalar")
+                        })?,
+                        "update.check_interval",
+                    )?)
+                    .map_err(|_| Error::msg("config: `update.check_interval` is too large"))?,
+                    None => DEFAULT_CHECK_INTERVAL,
+                };
+                UpdateConfig {
+                    enabled: flag("enabled", true)?,
+                    auto: flag("auto", true)?,
+                    check_interval,
+                }
+            }
+            None => UpdateConfig::default(),
+        };
+
         let cfg = Config {
             frequency,
             mode,
@@ -292,6 +367,7 @@ impl Config {
             beacon,
             http,
             microwaveprop,
+            update,
         };
 
         cfg.validate()?;
@@ -346,6 +422,11 @@ impl Config {
                     "config: microwaveprop.gridsquare must be 4–20 characters",
                 ));
             }
+        }
+        if self.update.check_interval < MIN_CHECK_INTERVAL {
+            return Err(Error::msg(format!(
+                "config: update.check_interval must be at least {MIN_CHECK_INTERVAL} seconds"
+            )));
         }
         Ok(())
     }
@@ -769,6 +850,82 @@ microwaveprop:
             assert!(
                 Config::from_yaml_str(&yaml).is_err(),
                 "accepted invalid config_version {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_block_absent_means_every_default() {
+        let yaml = "frequency: 28330000\nmode: cw\nsample_rate: 250000\n";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.update, UpdateConfig::default());
+        assert!(cfg.update.enabled, "the channel is on out of the box");
+        assert!(cfg.update.auto);
+        assert_eq!(cfg.update.check_interval, 3600);
+    }
+
+    #[test]
+    fn update_block_parses_every_field() {
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+update:
+  enabled: false
+  auto: false
+  check_interval: 900
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert!(!cfg.update.enabled);
+        assert!(!cfg.update.auto);
+        assert_eq!(cfg.update.check_interval, 900);
+    }
+
+    #[test]
+    fn update_block_fills_in_missing_keys() {
+        // A partial block is the shape an operator writes by hand when
+        // they only want to pin one knob.
+        let yaml = "\
+frequency: 28330000
+mode: cw
+sample_rate: 250000
+update:
+  auto: false
+";
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert!(cfg.update.enabled, "polling stays on");
+        assert!(!cfg.update.auto);
+        assert_eq!(cfg.update.check_interval, 3600);
+    }
+
+    #[test]
+    fn update_check_interval_below_the_floor_is_rejected() {
+        for interval in ["0", "59"] {
+            let yaml = format!(
+                "frequency: 28330000\nmode: cw\nsample_rate: 250000\nupdate:\n  check_interval: {interval}\n"
+            );
+            assert!(
+                Config::from_yaml_str(&yaml).is_err(),
+                "accepted check_interval {interval}"
+            );
+        }
+        let yaml =
+            "frequency: 28330000\nmode: cw\nsample_rate: 250000\nupdate:\n  check_interval: 60\n";
+        assert!(Config::from_yaml_str(yaml).is_ok(), "60 s is the floor");
+    }
+
+    #[test]
+    fn update_block_rejects_wrong_shapes() {
+        for block in [
+            "update: 5\n",
+            "update:\n  enabled: yes-please\n",
+            "update:\n  auto: 7\n",
+            "update:\n  check_interval: hourly\n",
+        ] {
+            let yaml = format!("frequency: 28330000\nmode: cw\nsample_rate: 250000\n{block}");
+            assert!(
+                Config::from_yaml_str(&yaml).is_err(),
+                "accepted malformed block {block:?}"
             );
         }
     }

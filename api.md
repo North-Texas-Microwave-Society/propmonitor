@@ -1,6 +1,6 @@
 # propmonitor API
 
-This document is the integration contract for `propmonitor`. It covers five
+This document is the integration contract for `propmonitor`. It covers six
 surfaces:
 
 1. The HTTP REST API served on the operator's LAN.
@@ -10,13 +10,15 @@ surfaces:
    beacon-signal-level measurements.
 5. The two-way config-sync protocol **microwaveprop** drives over a
    WebSocket for managed monitors.
+6. The self-update channel the daemon polls for new builds.
 
 Anyone integrating with propmonitor — extending the web UI, writing a
 third-party dashboard, or working on the microwaveprop side of §4/§5 —
 should be able to do so from this file alone.
 
-Sections 1–3 are propmonitor's own surfaces and this file is authoritative
-for them. Sections 4 and 5 describe endpoints microwaveprop serves; both are
+Sections 1–3 and 6 are propmonitor's own surfaces and this file is
+authoritative for them. Sections 4 and 5 describe endpoints microwaveprop
+serves; both are
 implemented and live there, and `docs/api/openapi.yaml` in that repo is the
 machine-readable spec. When the two disagree, the Elixir side wins and this
 file is the thing that needs fixing.
@@ -73,6 +75,11 @@ Example:
     "monitor_token": "redacted",
     "beacon_id": "00000000-0000-0000-0000-000000000000",
     "gridsquare": "EM12il"
+  },
+  "update": {
+    "enabled": true,
+    "auto": true,
+    "check_interval": 3600
   }
 }
 ```
@@ -85,6 +92,9 @@ The real token is only ever written via `PUT /api/config`.
 `microwaveprop.config_version` (§3, §5) is deliberately **not** in this view.
 It is bookkeeping between the node and microwaveprop, not something the LAN
 UI sets, and `PUT /api/config` carries the persisted value forward untouched.
+
+The `update` object is always present: an absent `update:` block in
+`config.yaml` means "every default", not "off". See §6.
 
 ### `PUT /api/config`
 
@@ -111,6 +121,86 @@ transition.
 Within the `microwaveprop` object, `enabled` defaults to `true` and
 `gridsquare` defaults to `""` when omitted; `monitor_token` and `beacon_id`
 are required whenever the object is present.
+
+The `update` object may be omitted entirely, in which case the node's
+current self-update settings carry forward unchanged — that is exactly what
+a config push from microwaveprop does (§5 never carries `update`). The web
+UI always sends it. Within the object, every field is optional and defaults
+to `enabled: true`, `auto: true`, `check_interval: 3600`.
+
+### `GET /api/update`
+
+Returns the state of the self-update channel (§6).
+
+```json
+{
+  "enabled": true,
+  "auto": true,
+  "check_interval": 3600,
+  "current": {
+    "version": "0.2.0",
+    "commit": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+    "dist_build": true,
+    "can_self_update": true
+  },
+  "latest": {
+    "version": "0.2.0",
+    "commit": "9a8b7c6d5e4f30211029384756abcdef01234567",
+    "built_at": "2026-08-30T18:04:11Z",
+    "assets": {
+      "propmonitor-x86_64-linux": "e3b0c442…",
+      "propmonitor-aarch64-linux": "9f86d081…",
+      "propmonitor-armv7-linux": "2c26b46b…"
+    }
+  },
+  "phase": "idle",
+  "last_check_at": "2026-08-30T18:12:00Z",
+  "last_error": null,
+  "install_path": "/opt/propmonitor/bin/propmonitor"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled`, `auto`, `check_interval` | the `update:` block from `config.yaml` (§3) |
+| `current.version` | crate version of the running build |
+| `current.commit` | commit it was built from; `"dev"` for a local build |
+| `current.dist_build` | built by the release workflows. Unattended updates require it |
+| `current.can_self_update` | in-place activation is available on this platform (Linux) |
+| `latest` | the build the channel offered on the last check, or `null` when up to date / never checked |
+| `phase` | `idle`, `checking`, `downloading`, `installing` |
+| `last_check_at` | RFC 3339 time of the last completed check, successful or not |
+| `last_error` | why the last check or install failed; `null` after a success |
+| `install_path` | where a new binary lands — the running executable's own path |
+
+`latest` being `null` with `last_check_at` set means "up to date". Both
+`null` means no check has completed yet.
+
+### `POST /api/update/check`
+
+Asks the node to check the channel now. Returns `200` with the same body as
+`GET /api/update`, captured before the check runs — the check itself is
+asynchronous and reports through the `update` WebSocket event (§2) and
+subsequent `GET /api/update` calls.
+
+Works regardless of `update.enabled`: that flag governs the periodic timer,
+not an explicit operator request.
+
+### `POST /api/update/install`
+
+Installs the build the last check found. Returns `200` with the
+`GET /api/update` body once the install has been started, or `409 Conflict`
+with `{"error": …}` when it cannot be:
+
+| Condition | Message |
+|---|---|
+| a check or install is already running | `an update check or install is already running` |
+| platform has no in-place activation | `in-place self-update requires a Linux install` |
+| nothing found by the last check | `no update available — check for updates first` |
+
+On success the daemon downloads, verifies and activates the new binary, then
+replaces its own process image. Connections drop as they would across any
+restart; the PID does not change. See §6 for the full sequence.
 
 ### `GET /api/devices`
 
@@ -310,6 +400,32 @@ bad driver args). The message is the Rust error string, meant for display in
 the UI, not for parsing. The HTTP server stays up; the fix is normally a new
 `PUT /api/config`.
 
+#### `update` — emitted on every self-update state transition
+
+```json
+{
+  "type": "update",
+  "phase": "downloading",
+  "latest": {
+    "version": "0.2.0",
+    "commit": "9a8b7c6d5e4f30211029384756abcdef01234567",
+    "built_at": "2026-08-30T18:04:11Z",
+    "assets": { "propmonitor-x86_64-linux": "e3b0c442…" }
+  },
+  "error": null
+}
+```
+
+`phase` is `idle`, `checking`, `downloading` or `installing`; `latest` and
+`error` mirror `GET /api/update`. Sent whether the transition came from the
+node's own timer, this client, or another browser — so a UI that renders
+this event stays correct without polling.
+
+A client that joins mid-install gets no replay of earlier phases; fetch
+`GET /api/update` on load for the current state, then follow these events.
+After an `installing` phase the daemon re-executes: expect the WebSocket to
+drop and reconnect onto the new build.
+
 ### Reconnection
 
 When `PUT /api/config` triggers a worker restart, the WebSocket stream pauses
@@ -354,6 +470,14 @@ microwaveprop:
   beacon_id: "…"                  # UUID of the beacon being monitored
   gridsquare: "EM12il"            # Maidenhead grid of THIS receiver, 4–20 chars
   config_version: 0               # managed monitors only — see §5
+
+# Optional; every field defaults. Absent block == all defaults, i.e. the
+# self-update channel is ON. Node-local: microwaveprop never sets these
+# and a config push from the website carries them forward untouched (§6).
+update:
+  enabled: true                   # poll the release channel on a timer
+  auto: true                      # install new builds without being asked
+  check_interval: 3600            # seconds between checks, minimum 60
 ```
 
 Validation rules:
@@ -376,6 +500,11 @@ Validation rules:
   `0`. Written by propmonitor itself, never by hand: it is the last version
   microwaveprop handed this node (§5). Editing or dropping it costs one
   spurious config re-push and SDR restart.
+- `update.enabled` / `update.auto` must be `true` or `false`.
+- `update.check_interval` is an integer >= 60 seconds. The floor keeps a
+  fleet of nodes off the release endpoint regardless of what the UI sends.
+- `update.auto` only takes effect on an official (CI-built) binary running
+  on Linux; see §6.
 
 The in-tree YAML parser (`src/yaml.rs`) supports the subset used here:
 scalars (numbers, quoted/unquoted strings, comments) and one level of nesting
@@ -855,6 +984,115 @@ A monitor still at version 0 has no stored config, and `GET` answers `304`
 for the node's implicit `known_version=0` — so the pull never has to render a
 null `config`, and the node never has to parse one.
 
+---
+
+## 6. Self-update channel
+
+Every push to `main` rebuilds all three Linux targets and republishes one
+fixed GitHub release, tagged `latest`
+(`.github/workflows/latest.yml`). Nodes poll it and install what they find.
+The daemon side is `src/update.rs`.
+
+### What the channel publishes
+
+| Asset | Consumer |
+|---|---|
+| `propmonitor-x86_64-linux`, `propmonitor-aarch64-linux`, `propmonitor-armv7-linux` | the daemon, self-updating |
+| the matching `.tar.gz` of each | `install.sh` |
+| `propmonitor-manifest.json` | the daemon, to decide whether to bother |
+
+One release, updated in place, always named `latest` — so every URL is
+stable and a node needs no discovery step:
+
+```
+https://github.com/North-Texas-Microwave-Society/propmonitor/releases/download/latest/propmonitor-manifest.json
+```
+
+```json
+{
+  "version": "0.2.0",
+  "commit": "9a8b7c6d5e4f30211029384756abcdef01234567",
+  "built_at": "2026-08-30T18:04:11Z",
+  "assets": {
+    "propmonitor-x86_64-linux": "<sha256 hex>",
+    "propmonitor-aarch64-linux": "<sha256 hex>",
+    "propmonitor-armv7-linux": "<sha256 hex>"
+  }
+}
+```
+
+Binaries are resolved **relative to the manifest URL** — same release, same
+directory — so a fork that publishes its own channel is one setting, not
+three. `PROPMONITOR_MANIFEST_URL` overrides the manifest URL for a staging
+channel or a local test; unset on a normal install.
+
+The `latest` git tag is cosmetic — it exists so the release page shows real
+contents. Assets are addressed by the release's tag name, not by the tag
+ref, and the publish job verifies the manifest URL is serving the new
+commit before it passes. A node that gets a 404 or an unreadable manifest
+records it in `last_error` and retries on the next tick; nothing is
+installed on a failed check.
+
+### Identity is the commit, not the version
+
+`main` moves without a version bump, so `0.2.0` cannot answer "am I
+current?". The comparison is `manifest.commit != current.commit`, where
+`current.commit` is baked in at build time by `build.rs` from
+`PROP_BUILD_COMMIT` (set by both release workflows). A local `cargo build`
+falls back to `git rev-parse HEAD`, then to `"dev"`.
+
+`build.rs` also records whether that environment variable was set at all,
+which is what `current.dist_build` reports: **only official builds update
+unattended.** A developer's laptop build is never silently replaced by a
+release binary — the operator can still press Install.
+
+### Install sequence
+
+All file work happens in the running binary's own directory, so the final
+step is an atomic `rename(2)` within one filesystem:
+
+1. Download the asset for this architecture to
+   `propmonitor.new.<pid>`, hashing the stream as it lands.
+2. Compare SHA-256 against the manifest. A mismatch aborts here — the
+   temp file is deleted and the running binary is untouched.
+3. `chmod 0755`, `fsync`.
+4. **Preflight:** run the new binary against a config path that cannot
+   exist. It must fail during config load and say so; a build that dies for
+   any other reason (bad glibc, missing symbol) is refused. This is the
+   same probe `install.sh` runs after downloading a release.
+5. Rename the current binary to `propmonitor.prev`, rename the new one into
+   place, `fsync` the directory. A failed rename rolls the backup back.
+6. `execve(2)` the installed path with argv and environment carried over.
+
+Step 6 is why this is smooth: **the PID does not change.** systemd sees no
+stop/start, the unit stays `active (running)`, and `Restart=`/start-limit
+accounting is untouched. The visible effect is what any restart does — the
+SDR is reopened, the in-memory ring buffer resets, WebSocket clients
+reconnect. If `execve` fails, the old image is still running and healthy;
+the daemon reports it and asks systemd for a conventional restart.
+
+### Requirements on the node
+
+- **Linux.** In-place activation is the whole mechanism; `can_self_update`
+  is `false` elsewhere and both auto and manual installs refuse.
+- **A writable binary directory.** `install.sh` installs to
+  `/opt/propmonitor/bin`, owned by the `propmonitor` service user, and the
+  unit lists it in `ReadWritePaths=`. Replacing a binary under
+  `/usr/local/bin` as a non-root daemon is not possible, which is why the
+  install location moved.
+
+### Rollback
+
+The previous binary is kept next to the current one:
+
+```bash
+sudo -u propmonitor mv /opt/propmonitor/bin/propmonitor.prev \
+                       /opt/propmonitor/bin/propmonitor
+sudo systemctl restart propmonitor
+```
+
+Set `update.auto: false` first, or the node will re-install the newer build
+on its next check.
 ---
 
 ## Versioning

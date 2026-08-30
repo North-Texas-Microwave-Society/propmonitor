@@ -1,0 +1,261 @@
+name: Latest
+
+# The self-update channel.
+#
+# Every push to main rebuilds all three Linux targets and republishes the
+# `latest` release with:
+#
+#   - propmonitor-<arch>-linux           raw binary, what the daemon installs
+#   - propmonitor-<arch>-linux.tar.gz    tarball, what install.sh installs
+#   - propmonitor-manifest.json          version, commit, built_at, SHA-256s
+#
+# The release tag never changes, so every node polls one fixed URL
+# (src/update.rs) and `install.sh` keeps resolving "latest release" to the
+# same build a self-updated node would land on.
+#
+# The `latest` git tag is pointed at the pushed commit so the release page
+# shows real contents. That tag is cosmetic, and deliberately so: this
+# repository receives a push-mirror from a private Forgejo instance, and
+# mirror syncs prune refs that do not exist upstream — so a tag created
+# here can be deleted again between pushes. The channel therefore depends
+# on the *release*, never on the tag: assets are addressed by the release's
+# tag_name string, and the final step of this job proves the URL nodes poll
+# actually serves this build before the job is allowed to pass.
+
+on:
+  push:
+    branches:
+      - main
+  # Manual re-publish, e.g. after fixing a workflow without a code change.
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight one: the channel should carry the
+# newest main build, not whichever job happened to finish last.
+concurrency:
+  group: latest-channel
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            cross_image: ''
+            artifact: propmonitor-x86_64-linux
+            asset: propmonitor-x86_64-linux.tar.gz
+            apt_packages: libsoapysdr-dev
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            cross_image: propmonitor-cross-aarch64
+            dockerfile: docker/cross-aarch64.Dockerfile
+            artifact: propmonitor-aarch64-linux
+            asset: propmonitor-aarch64-linux.tar.gz
+            apt_strip: binutils-aarch64-linux-gnu
+            cross_strip: aarch64-linux-gnu-strip
+
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+            cross_image: propmonitor-cross-armv7
+            dockerfile: docker/cross-armv7.Dockerfile
+            artifact: propmonitor-armv7-linux
+            asset: propmonitor-armv7-linux.tar.gz
+            apt_strip: binutils-arm-linux-gnueabihf
+            cross_strip: arm-linux-gnueabihf-strip
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      # build.rs bakes this in as the build's identity and marks the binary
+      # as a release build — the gate for unattended self-update.
+      PROP_BUILD_COMMIT: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native SoapySDR (x86_64)
+        if: ${{ !matrix.cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build cross Docker image
+        if: ${{ matrix.cross }}
+        run: docker build -t ${{ matrix.cross_image }} -f ${{ matrix.dockerfile }} docker/
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@latest
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # `cross` builds inside a container; Cross.toml passes
+      # PROP_BUILD_COMMIT through to it.
+      - name: Build (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Strip (native)
+        if: ${{ !matrix.cross }}
+        run: strip target/${{ matrix.target }}/release/propmonitor
+
+      - name: Strip (cross)
+        if: ${{ matrix.cross }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_strip }}
+          ${{ matrix.cross_strip }} target/${{ matrix.target }}/release/propmonitor
+
+      - name: Package
+        run: |
+          mkdir -p dist/propmonitor-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/propmonitor dist/propmonitor-${{ matrix.target }}/
+          cp target/${{ matrix.target }}/release/sdr_diag dist/propmonitor-${{ matrix.target }}/ 2>/dev/null || true
+          cp config.yaml dist/propmonitor-${{ matrix.target }}/ 2>/dev/null || true
+          tar czf ${{ matrix.asset }} -C dist propmonitor-${{ matrix.target }}
+          # The daemon installs the bare binary: it lands next to the
+          # running one, so there is nothing to extract on the node.
+          cp target/${{ matrix.target }}/release/propmonitor ${{ matrix.artifact }}
+
+      - name: Verify the build identity was baked in
+        run: |
+          # Cheap guard against the identity silently reverting to "dev",
+          # which would make every node think it is already current.
+          if ! grep -qa "${{ github.sha }}" ${{ matrix.artifact }}; then
+            echo "::error::PROP_BUILD_COMMIT was not embedded in the binary"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.artifact }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build the channel manifest
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          sha_of() {
+            local f="artifacts/$1/$1"
+            [[ -f "$f" ]] || { echo "::error::missing asset $1"; exit 1; }
+            sha256sum "$f" | cut -d' ' -f1
+          }
+
+          {
+            printf '{\n'
+            printf '  "version": "%s",\n' "$version"
+            printf '  "commit": "%s",\n' "$COMMIT"
+            printf '  "built_at": "%s",\n' "$built_at"
+            printf '  "assets": {\n'
+            printf '    "propmonitor-x86_64-linux": "%s",\n'  "$(sha_of propmonitor-x86_64-linux)"
+            printf '    "propmonitor-aarch64-linux": "%s",\n' "$(sha_of propmonitor-aarch64-linux)"
+            printf '    "propmonitor-armv7-linux": "%s"\n'    "$(sha_of propmonitor-armv7-linux)"
+            printf '  }\n'
+            printf '}\n'
+          } > propmonitor-manifest.json
+
+          cat propmonitor-manifest.json
+
+      # Done through the refs API rather than `git push`: it is idempotent
+      # (create or force-update in one call), needs no git credential
+      # juggling, and fails with a readable JSON error instead of a
+      # transport one. Non-fatal by design — see the note at the top of
+      # this file on why the tag is cosmetic.
+      - name: Point the `latest` tag at this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          if gh api "repos/${REPO}/git/refs/tags/latest" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${REPO}/git/refs/tags/latest" \
+              -f sha="$COMMIT" -F force=true >/dev/null \
+              && echo "moved the 'latest' tag to ${COMMIT}" \
+              || echo "::warning::could not move the 'latest' tag; release assets are unaffected"
+          else
+            gh api -X POST "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/latest" -f sha="$COMMIT" >/dev/null \
+              && echo "created the 'latest' tag at ${COMMIT}" \
+              || echo "::warning::could not create the 'latest' tag; release assets are unaffected"
+          fi
+
+      - name: Publish the `latest` release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          notes="Rolling build of \`main\` (${COMMIT}). Installed automatically by nodes with \`update.auto: true\`; \`install.sh\` installs from here too."
+
+          # One release, updated in place: recreating it would break the
+          # download URLs mid-flight for any node polling right now.
+          id=$(gh api "repos/${REPO}/releases/tags/latest" --jq .id 2>/dev/null || true)
+          if [[ -n "$id" ]]; then
+            gh api -X PATCH "repos/${REPO}/releases/${id}" \
+              -f name="latest (main)" -f body="$notes" -F prerelease=false -F draft=false >/dev/null
+          else
+            # target_commitish only matters here: GitHub uses it to create
+            # the tag if the ref is missing, which is exactly the state a
+            # mirror prune leaves behind.
+            gh api -X POST "repos/${REPO}/releases" \
+              -f tag_name=latest -f target_commitish="$COMMIT" \
+              -f name="latest (main)" -f body="$notes" \
+              -F prerelease=false -F draft=false >/dev/null
+          fi
+
+          # --clobber: same asset names every run.
+          gh release upload latest --clobber \
+            artifacts/propmonitor-x86_64-linux/propmonitor-x86_64-linux \
+            artifacts/propmonitor-aarch64-linux/propmonitor-aarch64-linux \
+            artifacts/propmonitor-armv7-linux/propmonitor-armv7-linux \
+            artifacts/propmonitor-x86_64-linux/propmonitor-x86_64-linux.tar.gz \
+            artifacts/propmonitor-aarch64-linux/propmonitor-aarch64-linux.tar.gz \
+            artifacts/propmonitor-armv7-linux/propmonitor-armv7-linux.tar.gz \
+            propmonitor-manifest.json
+
+      - name: Confirm the channel serves the new manifest
+        env:
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${REPO}/releases/download/latest/propmonitor-manifest.json"
+          for _ in $(seq 1 10); do
+            if curl -fsSL "$url" | grep -q "$COMMIT"; then
+              echo "channel is serving ${COMMIT}"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the channel is not serving the new manifest at $url"
+          exit 1

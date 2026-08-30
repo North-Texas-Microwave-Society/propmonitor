@@ -141,14 +141,54 @@ Afterwards:
 | Web UI          | `http://<your-ip>:5760`                         |
 | Logs            | `sudo journalctl -u propmonitor -f`             |
 | Config          | `sudo nano /etc/propmonitor/config.yaml`        |
+| Binary          | `/opt/propmonitor/bin/propmonitor`              |
 | Restart         | `sudo systemctl restart propmonitor`            |
 | Service status  | `systemctl status propmonitor`                  |
+
+### Staying up to date
+
+**A node keeps itself current.** It follows the `main` branch: every push
+rebuilds the binaries, and each node checks hourly, installs a new build and
+restarts itself in place. Nothing to run, no reboot, no reinstall.
+
+"In place" is literal — the daemon replaces its own process image, so the
+PID never changes and systemd sees no restart. The interruption is the same
+as any restart: the SDR is reopened and the live waterfall history resets,
+which for a 24/7 beacon monitor costs one measurement period.
+
+The web UI shows the running build and what the channel offers, with
+**Check for update** and **Install** buttons for doing it on your schedule.
+Settings → *software updates* has the three knobs:
+
+```yaml
+update:
+  enabled: true          # watch for new builds at all
+  auto: true             # install them without being asked
+  check_interval: 3600   # seconds between checks (minimum 60)
+```
+
+With `auto: false` the node still tells you an update is waiting and leaves
+the decision to you.
+
+Something wrong with a new build? The previous binary is kept right next to
+the current one:
+
+```bash
+sudo -u propmonitor mv /opt/propmonitor/bin/propmonitor.prev \
+                       /opt/propmonitor/bin/propmonitor
+sudo systemctl restart propmonitor
+```
+
+Turn `auto` off before rolling back, or the node will install the newer
+build again on its next check. Downloads are verified against a SHA-256
+published with the release and the new binary has to survive a startup
+probe, so a corrupted or broken download is refused rather than installed.
 
 ### Re-running the installer
 
 Safe. Existing settings become the defaults for each question, so holding
 Enter through the prompts changes nothing. It also upgrades the binary to
-the latest release.
+the latest release — though with self-update on, a node is already there.
 
 ### Unattended installs
 
@@ -165,10 +205,11 @@ curl -sSL https://raw.githubusercontent.com/North-Texas-Microwave-Society/propmo
 sudo systemctl disable --now propmonitor
 sudo rm -f /etc/systemd/system/propmonitor.service \
            /etc/modprobe.d/propmonitor-rtlsdr.conf \
-           /usr/local/bin/propmonitor /usr/local/bin/sdr_diag
+           /opt/propmonitor/bin/propmonitor /usr/local/bin/sdr_diag
 sudo systemctl daemon-reload
 sudo userdel propmonitor
 sudo rm -rf /etc/propmonitor        # deletes your config and upload token
+sudo rm -rf /opt/propmonitor
 ```
 
 ---
@@ -194,6 +235,11 @@ beacon:                        # used when mode == beacon
 
 http:
   bind: "0.0.0.0:5760"         # LAN-accessible on port 5760
+
+update:                        # self-update, see "Staying up to date"
+  enabled: true
+  auto: true
+  check_interval: 3600         # seconds, minimum 60
 
 # Uploads to prop.w5isp.com. All three fields are required.
 # microwaveprop:
@@ -228,6 +274,8 @@ Things worth knowing:
   self-service install is unaffected. Protocol: `api.md` §5.
 - `http.bind` is deliberately **not** synced: a bad bind pushed from the
   website would make this UI unreachable with no way back in.
+- The `update` block is node-local: a managed monitor's website config never
+  touches it, so a node's update policy stays a local decision.
 
 See [`api.md`](./api.md) for the full REST/WebSocket/upload contract.
 
@@ -327,21 +375,45 @@ step, so there is no npm anything.
 ### Releasing
 
 Development happens on a private Forgejo instance which push-mirrors to the
-public GitHub repository; GitHub Actions builds the release binaries there.
-Pushing a tag is what triggers a release:
+public GitHub repository; GitHub Actions builds the binaries there. There
+are two channels, and both matter:
+
+**`main` → the rolling channel.** Every push to `main` runs
+`.github/workflows/latest.yml`: it builds x86_64, aarch64 and armv7 Linux
+binaries and republishes the `latest` GitHub Release with the raw binaries,
+the tarballs, and `propmonitor-manifest.json`. **Deployed nodes install
+this automatically** (see *Staying up to date* and `api.md` §6), so a push
+to `main` reaches the fleet within the hour. `install.sh` resolves "latest
+release" to the same build, which keeps a fresh install and a self-updated
+node on identical binaries.
+
+A push to `main` is therefore a deployment. `cargo test` before pushing.
+
+**Tags → archival releases.** Pushing a version tag runs
+`.github/workflows/release.yml`, which attaches the tarballs to a
+`vX.Y.Z` release:
 
 ```bash
 cargo test && cargo build --release
 git tag v0.0.N && git push origin v0.0.N
 ```
 
-`.github/workflows/release.yml` cross-compiles x86_64, aarch64 and armv7
-Linux binaries and attaches them to a GitHub Release. The tagged commit
-should be the tip of `main` and should pass `cargo test`.
+Both workflows set `PROP_BUILD_COMMIT`, which `build.rs` bakes into the
+binary as its update identity and as the flag marking it an official build.
+A local `cargo build` is not marked, so a development binary is never
+auto-replaced by a release one.
 
 Because those runners are Ubuntu 24.04, the published binaries require glibc
 2.38 — that is what the support table at the top of this file reflects.
 Lowering the floor means changing the build images in `docker/`.
+
+To exercise the update path without touching the real channel, point a node
+at a local one:
+
+```bash
+PROPMONITOR_MANIFEST_URL=http://127.0.0.1:8099/propmonitor-manifest.json \
+  ./target/release/propmonitor config.yaml
+```
 
 Architecture notes for contributors are in [`CLAUDE.md`](./CLAUDE.md).
 

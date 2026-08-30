@@ -62,6 +62,35 @@ canvas#waterfall {
   display: inline-block;
 }
 
+#update-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #1f1f28;
+}
+
+#update-section .spacer { flex: 1; }
+
+#ro-update.err { color: #e3596a; }
+
+#update-section button {
+  background: #232330;
+  color: #b6b6c2;
+  border: 1px solid #2a2a36;
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+}
+
+#update-section button:hover:not(:disabled) { background: #2e2e3a; color: #e9e9f0; }
+
+#update-section button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 #settings-section {
   padding: 8px 10px;
 }

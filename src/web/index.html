@@ -29,6 +29,13 @@
     </div>
   </section>
 
+  <section id="update-section">
+    <span id="ro-update" class="muted">checking for updates…</span>
+    <span class="spacer"></span>
+    <button type="button" id="btn-check">Check for update</button>
+    <button type="button" id="btn-install" disabled>Install</button>
+  </section>
+
   <section id="settings-section">
     <details open>
       <summary>Settings</summary>
@@ -75,6 +82,19 @@
           <label>monitor_token<input name="mw_token" type="password" placeholder="leave as 'redacted' to keep"></label>
           <label>beacon_id (UUID)<input name="mw_beacon_id" type="text" placeholder="00000000-0000-0000-0000-000000000000"></label>
           <label>gridsquare (Maidenhead)<input name="mw_gridsquare" type="text" placeholder="FN31pr"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>software updates</legend>
+          <label class="checkbox">
+            <input name="up_enabled" type="checkbox">
+            Watch for new builds
+          </label>
+          <label class="checkbox">
+            <input name="up_auto" type="checkbox">
+            Install them automatically (restarts in place)
+          </label>
+          <label>check every (minutes)<input name="up_interval" type="number" step="1" min="1"></label>
         </fieldset>
 
         <div class="actions">
