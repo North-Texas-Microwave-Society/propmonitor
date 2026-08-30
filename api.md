@@ -12,8 +12,14 @@ surfaces:
    WebSocket for managed monitors.
 
 Anyone integrating with propmonitor — extending the web UI, writing a
-third-party dashboard, or implementing the matching ingest endpoint on the
-microwaveprop side — should be able to do so from this file alone.
+third-party dashboard, or working on the microwaveprop side of §4/§5 —
+should be able to do so from this file alone.
+
+Sections 1–3 are propmonitor's own surfaces and this file is authoritative
+for them. Sections 4 and 5 describe endpoints microwaveprop serves; both are
+implemented and live there, and `docs/api/openapi.yaml` in that repo is the
+machine-readable spec. When the two disagree, the Elixir side wins and this
+file is the thing that needs fixing.
 
 ---
 
@@ -22,19 +28,22 @@ microwaveprop side — should be able to do so from this file alone.
 Bind: `0.0.0.0:5760` by default (configurable via `http.bind`). LAN-accessible,
 no authentication. Intended for trusted networks.
 
-All responses are `application/json` unless noted. Errors use the shape
-`{"error": "<message>"}` with appropriate `4xx` / `5xx` status.
+All responses are `application/json` unless noted. Errors raised by a handler
+use the shape `{"error": "<message>"}` with an appropriate `4xx` / `5xx`
+status. A request body that axum's JSON extractor cannot deserialize at all is
+rejected before the handler runs, with the extractor's own plain-text `4xx` —
+so don't assume every error carries that JSON shape.
 
 ### `GET /`
 
 Returns the embedded `index.html` for the single-page web UI.
 Response: `200 text/html`.
 
-### `GET /assets/{name}`
+### `GET /assets/app.js`, `GET /assets/style.css`
 
-Returns one of the embedded static files (`app.js`, `style.css`).
-Response: `200` with the appropriate `Content-Type`. `404` if `name` is not a
-known asset.
+Returns the embedded static file. Response: `200` with the appropriate
+`Content-Type`. These are the only two asset routes; anything else under
+`/assets/` is an unrouted `404`.
 
 ### `GET /api/config`
 
@@ -62,14 +71,20 @@ Example:
   "microwaveprop": {
     "enabled": true,
     "monitor_token": "redacted",
-    "beacon_id": "00000000-0000-0000-0000-000000000000"
+    "beacon_id": "00000000-0000-0000-0000-000000000000",
+    "gridsquare": "EM12il"
   }
 }
 ```
 
 The `monitor_token` field is **redacted** on read — the response contains the
-literal string `"redacted"` if a token is configured, or `null` if not. The
-real token is only ever written via `PUT /api/config`.
+literal string `"redacted"` if a token is configured, or the whole
+`microwaveprop` object is `null` when the block is absent from `config.yaml`.
+The real token is only ever written via `PUT /api/config`.
+
+`microwaveprop.config_version` (§3, §5) is deliberately **not** in this view.
+It is bookkeeping between the node and microwaveprop, not something the LAN
+UI sets, and `PUT /api/config` carries the persisted value forward untouched.
 
 ### `PUT /api/config`
 
@@ -82,14 +97,20 @@ Behavior:
 
 1. Validate the body. On failure: `400 Bad Request` with an `error` message.
 2. Atomically rewrite `config.yaml` (write to `config.yaml.tmp`, fsync,
-   rename).
+   rename). A failed write or a failed rebind is `500 Internal Server Error`.
 3. Signal the worker to stop, wait for it, spawn a new worker with the new
    config. The SoapySDR device is released and reopened.
-4. Respond `200 OK` with the new config (token still redacted).
+4. Wake the sync task so the edit is reported up to microwaveprop as a
+   `config_report` (§5). Nothing about the response depends on that.
+5. Respond `200 OK` with the new config (token still redacted).
 
 During step 3 the WebSocket stream pauses briefly. The new worker emits a
 fresh `device_info` event when it comes up, which clients use to detect the
 transition.
+
+Within the `microwaveprop` object, `enabled` defaults to `true` and
+`gridsquare` defaults to `""` when omitted; `monitor_token` and `beacon_id`
+are required whenever the object is present.
 
 ### `GET /api/devices`
 
@@ -196,7 +217,11 @@ frames.
 
 ### Event types
 
-#### `device_info` — emitted once when the worker comes up
+#### `device_info` — emitted once when the worker comes up, and replayed to every new client
+
+A client that connects mid-run immediately receives the last `device_info`
+rather than waiting for the next worker restart, so headers render on the
+first frame.
 
 ```json
 {
@@ -225,7 +250,10 @@ frames.
 }
 ```
 
-`bins.length == 1024`. Values are **linear power** (`|x|²`), not dB. The first
+`bins.length == 1024` (`worker::WATERFALL_FFT_N`). This is the display FFT
+only — the measurement path in `measure.rs` runs its own 16384-point FFT, so
+"frame" in §4's gating discussion means a 16384-sample analysis frame, not a
+waterfall row. Values are **linear power** (`|x|²`), not dB. The first
 bin corresponds to frequency `f0_hz` relative to the tuned center; bin `k`
 corresponds to `f0_hz + k * bin_hz`. The center bin (index 512) is DC. Clients
 convert to dB with `10 * log10(max(value, 1e-30))`.
@@ -271,6 +299,17 @@ the window. See §4 for the same gating in the upload payload.
 (including network failure). On error, `queued` reflects the current retry-
 queue depth.
 
+#### `error` — a worker-level failure
+
+```json
+{ "type": "error", "message": "stream read failed: …" }
+```
+
+Emitted when the SDR worker thread dies (device unplugged, stream error,
+bad driver args). The message is the Rust error string, meant for display in
+the UI, not for parsing. The HTTP server stays up; the fix is normally a new
+`PUT /api/config`.
+
 ### Reconnection
 
 When `PUT /api/config` triggers a worker restart, the WebSocket stream pauses
@@ -313,18 +352,25 @@ microwaveprop:
   enabled: true                   # checkbox in the web UI
   monitor_token: "…"              # 32-byte base64-url, from POST /me/beacon-monitors
   beacon_id: "…"                  # UUID of the beacon being monitored
+  gridsquare: "EM12il"            # Maidenhead grid of THIS receiver, 4–20 chars
   config_version: 0               # managed monitors only — see §5
 ```
 
 Validation rules:
 
-- `frequency` > 0.
+- `frequency` finite and > 0.
 - `mode` must be one of the listed values.
-- `sample_rate` >= 250000 (lower rates pin the waterfall FFT under 250 Hz/bin,
-  unacceptable for visual band overview).
-- `gain` either a number or omitted.
+- `sample_rate` finite and >= 250000 (lower rates pin the waterfall FFT under
+  250 Hz/bin, unacceptable for visual band overview).
+- `gain` either a finite number or omitted.
+- `ppm` finite.
 - `period_seconds` >= 5.
-- `beacon.bandwidth_hz` > 0 and <= `sample_rate / 2`.
+- `mode: beacon` requires a `beacon:` block.
+- `beacon.offset_hz` finite; `beacon.bandwidth_hz` finite, > 0, and
+  <= `sample_rate / 2`.
+- The whole passband must fit inside the sampled spectrum:
+  `|offset_hz| + bandwidth_hz / 2 <= sample_rate / 2`.
+- `microwaveprop.gridsquare` is either empty or 4–20 characters.
 - `microwaveprop.enabled` must be `true` AND `monitor_token` must be non-empty AND `beacon_id` must be non-empty AND `gridsquare` must be non-empty for uploads to actually run. Any of these conditions false → uploads paused.
 - `microwaveprop.config_version` must be a non-negative integer. Defaults to
   `0`. Written by propmonitor itself, never by hand: it is the last version
@@ -341,8 +387,9 @@ multi-document syntax.
 ## 4. microwaveprop upload contract
 
 This is the wire format the propmonitor uploader emits. The matching server
-endpoint is **not yet implemented** in microwaveprop — this section is the
-spec both sides should target.
+endpoint is **live** in microwaveprop
+(`MicrowavepropWeb.Api.V1.BeaconMonitorMeasurementController`), and the
+authoritative machine-readable spec is `docs/api/openapi.yaml` in that repo.
 
 ### Endpoint
 
@@ -355,11 +402,18 @@ Authorization: Bearer <monitor_token>
 Content-Type: application/json
 ```
 
-`<monitor_token>` is the 32-byte base64-url string returned once by
-`POST /api/v1/me/beacon-monitors` on the microwaveprop side
-(`lib/microwaveprop/beacon_monitors.ex:30-37`). The same Bearer-token plug
-already used for the rest of the v1 API
-(`lib/microwaveprop_web/api/auth.ex`) handles this.
+`<monitor_token>` is the 32-byte base64-url string returned by
+`POST /api/v1/me/beacon-monitors` on the microwaveprop side. It authenticates
+a *monitor*, not a user, and is resolved by a dedicated plug
+(`MicrowavepropWeb.Api.MonitorAuth`) rather than the user-API-token plug —
+the two token spaces are separate and not interchangeable. A monitor token is
+also readable any time from the monitor's page on the website, and rotating
+one is a deliberate act there; a rotated token invalidates the old one
+immediately.
+
+Monitors come in two `kind`s. `self_service` is the Python client; `managed`
+is this Rust daemon plus the two-way config sync in §5. Both upload
+measurements through this endpoint identically — `kind` only gates §5.
 
 ### Request body
 
@@ -386,8 +440,8 @@ Field semantics:
 
 | Field | Type | Notes |
 |---|---|---|
-| `beacon_id` | string (UUID) | Identifies *which* beacon this measurement is for. Canonical key on the microwaveprop side. The same monitor_token can only legitimately report for the beacon its record is associated with; mismatches are server policy. |
-| `gridsquare` | string | Maidenhead grid square of the RECEIVER station (e.g. `"FN31pr"`). 4–20 characters. Required for the server to correlate signal strength with propagation-path distance and bearing. |
+| `beacon_id` | string (UUID) | Identifies *which* beacon this measurement is for. Canonical key on the microwaveprop side. A monitor record is not bound to one beacon: any monitor may report for any beacon that is **approved** and **on the air**, and anything else is a `404`. |
+| `gridsquare` | string | Maidenhead grid square of the RECEIVER station (e.g. `"FN31pr"`). The server caps it at 20 characters; propmonitor additionally requires 4–20 before it will upload at all. Lets the server correlate signal strength with propagation-path distance and bearing. |
 | `frequency_hz` | integer | The propmonitor *tuned* frequency in Hz. Not the beacon's nominal frequency; the operator may intentionally tune slightly off to compensate for radio offset. |
 | `measured_at` | string | UTC ISO-8601 timestamp at the **start** of the integration window. |
 | `integration_s` | number | The measurement window length in seconds. Equal to `period_seconds` in propmonitor config. |
@@ -399,7 +453,36 @@ Field semantics:
 | `snr_peak_db` | number | `signal_peak_dbfs - noise_floor_dbfs`. |
 | `snr_avg_db` | number | `signal_avg_dbfs - noise_floor_dbfs`. |
 | `signal_active_fraction` | number | Fraction of FFT frames in the window where in-band power exceeded `noise_floor + 3 dB`. `1.0` = continuous carrier; `~0.5` = 50%-keyed CW; `0.0` = nothing heard. |
-| `propmonitor_version` | string | Build version of the reporting client. Diagnostic only — helps the server correlate stat shifts with client upgrades. |
+| `propmonitor_version` | string | Build version of the reporting client. Diagnostic only — helps the server correlate stat shifts with client upgrades. Max 32 characters. |
+
+Everything above except `gridsquare` is **required** by the server; a missing
+field is a `422`. `gridsquare` is optional server-side (the Python client may
+omit it) but propmonitor refuses to upload without one — see §3.
+
+The server also accepts five optional fields this client never sends, used by
+the self-service Python client: `op_mode` (≤32 chars), `decoded_callsign`
+(≤20), `decoded_grid` (≤8), `decoded_dbm` (−160…60), and
+`frequency_offset_hz`. Sending them is legal; omitting them is normal.
+
+### Server-side value bounds
+
+Out-of-range values are rejected as `422` rather than clamped, so a client bug
+is loud instead of silently poisoning the stats:
+
+| Field | Accepted range |
+|---|---|
+| `frequency_hz` | > 0 |
+| `integration_s` | 5 … 3600 |
+| `passband_hz` | > 0 |
+| `gain_db` | −10 … 80 |
+| `noise_floor_dbfs`, `signal_peak_dbfs`, `signal_avg_dbfs` | −200 … 0 |
+| `snr_peak_db`, `snr_avg_db` | −50 … 120 |
+| `signal_active_fraction` | 0.0 … 1.0 |
+| `measured_at` | within ±24 h of server time |
+
+The `measured_at` window exists so a monitor cannot back- or forward-date
+measurements into hourly aggregates. A node with a badly wrong clock will see
+every upload rejected with `422`; check NTP before checking anything else.
 
 ### Signal-present gating
 
@@ -420,20 +503,58 @@ heard" and either filter it out of trend lines or carry it explicitly.
 
 `dBFS` is uncalibrated — it's relative to the SDR ADC full scale and
 depends on gain. To convert to absolute power (dBm) the microwaveprop
-side may keep a per-monitor calibration offset (possibly indexed by
-`gain_db`); that calibration is not configured in propmonitor and not
-included in the upload.
+side may one day keep a per-monitor calibration offset (possibly indexed by
+`gain_db`); no such offset exists today, and it would live entirely on the
+server — nothing about it is configured in propmonitor or carried in the
+upload. Until then, `snr_*_db` is the gain-independent field and the one
+downstream analysis should prefer.
 
 ### Responses
 
+Errors are RFC 9457 `application/problem+json`, not the `{"error": …}` shape
+the LAN API uses:
+
+```json
+{
+  "type": "about:blank",
+  "title": "not_found",
+  "status": 404,
+  "detail": "beacon_id is unknown, unapproved, or marked off-the-air."
+}
+```
+
+A `422` adds an `errors` object mapping each rejected field to its messages:
+
+```json
+{
+  "type": "about:blank",
+  "title": "validation_failed",
+  "status": 422,
+  "detail": "One or more fields are invalid.",
+  "errors": { "gain_db": ["must be less than or equal to 80.0"] }
+}
+```
+
+`title` is a stable slug; `detail` is prose and may be reworded. propmonitor
+dispatches on the status code alone and never parses the body — the shape is
+documented for humans debugging a station.
+
 | Status | Meaning | Client behavior |
 |---|---|---|
-| `204 No Content` | Accepted, recorded. Server should update the monitor's `last_seen_at`. | Mark measurement uploaded. |
-| `400 Bad Request` | Malformed body or unknown `beacon_id`. | Log, drop measurement (don't retry — schema mismatch won't fix itself). |
-| `401 Unauthorized` | Bad/missing/revoked monitor token. | Log, stop uploading until config is updated. |
-| `429 Too Many Requests` | Rate limited. | Enqueue and retry with exponential backoff (1 s → 5 min cap). |
-| `5xx` | Server-side failure. | Enqueue, retry with exponential backoff (1 s → 5 min cap). |
+| `204 No Content` | Accepted and recorded. The monitor's `last_seen_at` is stamped — an accepted upload *is* the self-service heartbeat. | Pop from queue, reset backoff. |
+| `401 Unauthorized` | Bad/missing/revoked/expired monitor token. | Drop the measurement. Uploads keep failing until the token is fixed. |
+| `404 Not Found` | `beacon_id` is unknown, not a UUID, unapproved, or marked off-the-air. | Drop the measurement. Retrying will not help; an admin un-approving a beacon is meant to stop the monitor cleanly. |
+| `409 Conflict` | A measurement for this `(monitor, beacon, measured_at)` already exists — normally a retried POST whose first attempt actually landed. | Drop the measurement. Nothing is lost. |
+| `422 Unprocessable Entity` | Malformed body, missing required field, or an out-of-range value. | Drop the measurement (a schema mismatch won't fix itself). |
+| `429 Too Many Requests` | Rate limited. | Keep in queue, retry with exponential backoff (1 s → 5 min cap). |
+| `5xx` | Server-side failure. | Keep in queue, retry with exponential backoff (1 s → 5 min cap). |
 | network error / timeout | Unreachable. | Same as `5xx`. |
+
+The client's actual rule (`uploader::classify_status`) is coarser than the
+table: **2xx → accepted, 429 → retry, any other 4xx → drop, everything else
+→ retry.** The per-status rows above describe why each code lands where it
+does; a new 4xx added server-side will be dropped by existing clients, so
+anything meant to be retried must be a 429 or a 5xx.
 
 ### Retry queue
 
@@ -444,10 +565,17 @@ restarts.
 
 ### Rate / batching
 
-One measurement per POST. If `period_seconds == 60`, the upload rate is
-1/minute per monitor. Microwaveprop's per-token rate limit
-(`lib/microwaveprop_web/api/rate_limiter.ex`) should be set with this in
-mind; the default authenticated bucket is sufficient.
+One measurement per POST; payloads are never batched. If
+`period_seconds == 60`, the steady-state rate is 1/minute per monitor.
+
+Microwaveprop rate-limits **per monitor token** (not per IP, so co-located
+stations behind one NAT don't punish each other) at **60 requests per 60 s
+fixed window**, shared across the ingest endpoint and the §5 polling
+endpoints. That is ~60× the steady-state rate, leaving headroom for a
+queue-drain burst after an outage. Responses carry `ratelimit-limit`,
+`ratelimit-remaining`, and `ratelimit-reset`; a `429` also carries
+`retry-after` (seconds). propmonitor's own backoff already respects the
+spirit of these headers without reading them.
 
 ---
 
@@ -455,12 +583,20 @@ mind; the default authenticated bucket is sufficient.
 
 A **managed** monitor is created on the microwaveprop website, which then
 holds the authoritative config plus a version counter and drives the node
-over a WebSocket. Self-service installs (no `monitor_token`) never touch any
-of this — the sync task idles until a token is configured, and starts
-without a restart when one is pasted into the LAN UI.
+over a WebSocket. An install with no `monitor_token` never touches any of
+this — the sync task idles until a token is configured, and starts without a
+restart when one is pasted into the LAN UI.
+
+Kind matters here in a way it does not for §4: a token minted for a
+`self_service` monitor authenticates uploads perfectly well but is refused
+`403` on every endpoint in this section. If a propmonitor node logs repeated
+`403`s from sync, the monitor was created with the wrong kind on the website,
+and kind is immutable once created — make a new monitor.
 
 Implemented in `src/sync.rs`. The matching server side is
-`MicrowavepropWeb.MonitorSocket` on the microwaveprop repo.
+`MicrowavepropWeb.MonitorSocket` (frames) and
+`MicrowavepropWeb.Api.V1.BeaconMonitorConfigController` (polling fallback) on
+the microwaveprop repo.
 
 ### Endpoint
 
@@ -473,12 +609,30 @@ Same `monitor_token` as §4, in a header rather than a query string so it
 stays out of proxy access logs. The URL is hardcoded as
 `MICROWAVEPROP_SYNC_ENDPOINT` in `src/sync.rs`.
 
+Auth rides the HTTP upgrade, so there is no in-band authentication frame. The
+upgrade is refused with:
+
+- `401` — bad, missing, revoked, or expired token.
+- `403` — the token belongs to a `self_service` monitor. Only `managed`
+  monitors have a server-side config to sync, and the same `403` applies to
+  every polling endpoint below.
+- `426` — the request arrived without WebSocket upgrade headers.
+
+Only one socket per monitor is served: when a reconnect lands on a different
+pod, the server displaces the older session rather than running two. A node
+that sees its socket closed for no apparent reason should simply reconnect.
+
+The server's idle timeout is 120 s, which the node's 30 s ping and 60 s
+`status` frame stay well inside.
+
 ### Envelope
 
 Every frame is a JSON **text** frame carrying `v` (protocol version, `1`)
 and `type`. Remaining keys are frame-specific and sit at the top level, not
-nested in a `payload` object. Unknown `type` values are logged and skipped;
-unknown keys are ignored.
+nested in a `payload` object. Unknown keys are ignored on both sides. An
+unknown `type` is logged and skipped by the node, and answered with an
+`unknown_type` error frame by microwaveprop; neither drops the session.
+Binary frames are rejected (`bad_frame`) — everything here is text.
 
 ### The synced config object
 
@@ -507,9 +661,13 @@ This is **not** the `GET /api/config` shape. Two deliberate omissions:
 - **`http`** — pushing a bad `bind` from the website would strand the LAN
   UI with no remote way back in. The node keeps its own `http` block.
 
-`upload_enabled` maps to `microwaveprop.enabled` on disk. Validation is the
-same as §3: microwaveprop should reject out-of-range values rather than
-push a config the node will refuse.
+`upload_enabled` maps to `microwaveprop.enabled` on disk. Microwaveprop
+mirrors §3's validation in `Microwaveprop.BeaconMonitors.ManagedConfig` so it
+never pushes a config the node will refuse, and adds three bounds of its own
+that the node does not enforce: `period_seconds <= 86400`, `driver` 1–200
+characters, and `beacon_id` must parse as a UUID (or be empty). A config that
+fails validation is answered with an `error` frame (`invalid_config`) or a
+`422`, and the stored config is left alone.
 
 On the node, `gain`, `ppm`, `beacon`, `upload_enabled`, `beacon_id` and
 `gridsquare` are optional on the way in and fall back to
@@ -527,7 +685,7 @@ unparsable, which costs the node the ability to answer — send them all.
 | `config_applied` | node→prop | `version`, `ok`, `error` |
 | `config_report` | node→prop | `base_version`, `config` |
 | `config_accepted` | prop→node | `version` |
-| `status` | node→prop | `local_ip`, `local_port`, `uploader`, `last_measurement` |
+| `status` | node→prop | `local_ip`, `local_port`, `uploader`, `last_measurement` (microwaveprop also accepts an optional `client_version` here; propmonitor sends it only in `hello`) |
 | `error` | prop→node | `code`, `message` |
 
 #### `hello` — first frame on every connection
@@ -552,9 +710,19 @@ fails. `local_port` comes from `http.bind`. Together they give the website
 the `http://<local_ip>:<local_port>` link to the node UI — reachable only
 from the operator's own network.
 
-Microwaveprop answers `hello_ack {config_version}` and then reconciles: if
-it holds no config yet it adopts the node's (`config_accepted`), and if the
-node is behind it sends `config_push`.
+Microwaveprop answers `hello_ack {config_version}` and then reconciles, in
+one of three ways:
+
+- **`config_version == 0`** (a managed monitor created on the website but
+  never configured) — it adopts the node's `config`, mints version 1, and
+  follows the ack with `config_accepted {version}`. If the `hello` carried no
+  usable `config` there is nothing to adopt and nothing is sent.
+- **`applied_config_version < config_version`** — it follows the ack with
+  `config_push {version, config}`.
+- **otherwise** — in sync; the ack is the whole answer.
+
+The `hello` also stamps the node's `local_ip`, `local_port`, and
+`client_version` on the monitor record, and marks it connected.
 
 #### `config_push` / `config_applied`
 
@@ -575,6 +743,12 @@ Node behavior, in order:
    rejected config replies `ok: false` with `error` set and leaves the
    running config untouched.
 
+Server side, `ok: true` advances the monitor's applied-version marker, guarded
+so a replayed or out-of-order frame cannot walk it backwards. `ok: false` is
+logged with the `error` string and nothing else happens — the website keeps
+showing the node as behind, which is the truth. A `config_applied` without an
+integer `version` earns a `bad_frame` error.
+
 #### `config_report` / `config_accepted`
 
 ```json
@@ -583,10 +757,16 @@ Node behavior, in order:
 ```
 
 Sent after every successful local edit through `PUT /api/config`.
-Microwaveprop accepts it unconditionally, mints the next version, and the
-node persists that version. If the socket is down the edit stays pending
-and goes up through the polling `POST` instead — and if it is still pending
-when a session drops, the next session re-sends it.
+Microwaveprop accepts it unconditionally *if it validates* — last write wins,
+arbitrated by arrival order there — mints the next version, records it as
+already applied (the node is running it, so no push is echoed back), and the
+node persists that version. `base_version` is accepted for symmetry but
+ignored: versions are minted only by microwaveprop. An invalid config is
+answered with an `error` frame (`invalid_config`) and no version is minted.
+
+If the socket is down the edit stays pending and goes up through the polling
+`POST` instead — and if it is still pending when a session drops, the next
+session re-sends it.
 
 #### `status` — every 60 s, also the app-level heartbeat
 
@@ -613,13 +793,28 @@ when a session drops, the next session re-sends it.
 first window completes. One status frame goes out immediately after
 `hello`, so the website flips to "online" without waiting a minute.
 
+Microwaveprop keeps only the connection facts — `local_ip`, `local_port`,
+`client_version`, and the arrival time. `uploader` and `last_measurement` are
+accepted for parity with the LAN status shape and then discarded; measurement
+data reaches the server through §4, not here. A monitor reads as **online**
+for **180 s** after its last status (frame or poll) — two missed heartbeats
+plus slack. Nothing stores an "online" flag, so a pod dying with the socket
+open cannot strand one.
+
 #### `error`
 
 ```json
 { "v": 1, "type": "error", "code": "bad_frame", "message": "…" }
 ```
 
-Logged by the node; the session continues.
+Logged by the node; the session continues. Codes:
+
+| Code | Meaning |
+|---|---|
+| `bad_frame` | Not JSON, missing `v`/`type`, a binary frame, or a frame missing a key its type requires. |
+| `unsupported_version` | The frame's `v` is not `1`. |
+| `unknown_type` | The server does not know that `type`. |
+| `invalid_config` | The `config` in a `hello`, `config_report`, or adoption failed validation. `message` carries the field errors. |
 
 ### Versions
 
@@ -644,20 +839,39 @@ token:
 
 | Request | Response |
 |---|---|
-| `GET /api/v1/beacon-monitor/config?known_version=N` | `200 {"version": M, "config": {…}}`, or `304` when `M == N` |
-| `POST /api/v1/beacon-monitor/config` `{"base_version": N, "config": {…}}` | `200 {"version": M}` |
+| `GET /api/v1/beacon-monitor/config?known_version=N` | `200 {"version": M, "config": {…}}`, or `304` when `M == N`. `400` if `known_version` is not a non-negative integer; omitting it means `0`. |
+| `POST /api/v1/beacon-monitor/config` `{"base_version": N, "config": {…}}` | `200 {"version": M}`. `422` if the body has no `config` object or the config fails validation. |
 | `POST /api/v1/beacon-monitor/status` (the `status` frame minus `v`/`type`) | `204` |
+
+All three also answer `401` (bad token), `403` (self-service monitor), and
+`429` (the shared per-monitor bucket from §4).
 
 A cycle pushes a pending local edit up **first**, then pulls, then posts
 status: reports are accepted unconditionally, so reporting first keeps a
 local edit from being clobbered by the version being pulled. The pulled
 config goes through the same three-step apply decision as `config_push`.
 
+A monitor still at version 0 has no stored config, and `GET` answers `304`
+for the node's implicit `known_version=0` — so the pull never has to render a
+null `config`, and the node never has to parse one.
+
 ---
 
 ## Versioning
 
-This document describes API **v0**. Breaking changes will be announced via a
-new top-level major version in the URL (`/api/v2/…`). Additive changes
-(new optional config fields, new optional JSON fields in responses) are
-in-place. Clients should ignore unknown JSON fields.
+Three independent version numbers appear in this document:
+
+- **The propmonitor LAN API (§1, §2) is unversioned.** It ships with the
+  binary and its only client is the embedded web UI, so it changes with the
+  release rather than behind a URL prefix.
+- **The microwaveprop REST API (§4, §5) is `v1`**, in the path
+  (`/api/v1/…`). Breaking changes arrive as `/api/v2/…`; additive ones (new
+  optional request fields, new response fields) land in place.
+- **The sync protocol envelope (§5) is `v: 1`.** Microwaveprop enforces it —
+  a node→prop frame carrying any other `v` earns an `unsupported_version`
+  error frame. The node is the lenient half: it stamps `v: 1` on everything
+  it sends and ignores `v` on everything it receives, dispatching purely on
+  `type`, so a bump reaches it as new frame types rather than a hard break.
+
+In every direction, ignore unknown JSON fields rather than treating them as
+errors. Unknown frame types are logged and skipped on both sides.
