@@ -19,26 +19,54 @@ cargo build --release
 ./target/release/propmonitor path/to.yaml
 cargo test
 cargo test tone_in_passband_has_high_snr      # single test
-cargo clippy
+cargo test --lib sync::                       # one module's tests
+cargo clippy --all-targets -- -D warnings     # the gate; plain `cargo clippy` misses tests
 cargo fmt
 ```
 
-Runtime dependency: a working `SoapySDR` install plus the driver module
-for the dongle being used.
+Build prerequisites: Rust 1.85+ (floor comes from `reqwest` 0.13; there is
+no `rust-version` key in `Cargo.toml` enforcing it), `pkg-config`, and
+SoapySDR headers. Runtime additionally needs the driver module for the
+dongle being used.
+
+There is no `tests/` directory. Every test lives in an inline
+`#[cfg(test)] mod tests` at the bottom of its own module, including the
+axum handler tests in `server.rs` (via `tower::ServiceExt::oneshot`) and
+the sync-protocol tests in `sync.rs` (which stand up a loopback
+WebSocket server). New tests go in the module under test, not a new file.
+
+## Repo layout and forge
+
+`origin` is a private Forgejo instance (`git.mcintire.me`) that
+push-mirrors to the public GitHub repo. Consequences:
+
+- Pull requests go to Forgejo through the `gitea` MCP server. `gh` does
+  not work against it.
+- CI only exists on the GitHub side. Nothing runs on push to Forgejo, so
+  `cargo clippy --all-targets -- -D warnings && cargo test` locally is
+  the only pre-merge check there is.
 
 ## Releasing
 
-When pushing a release, bump the version tag:
-
 ```bash
-cargo test && cargo build --release   # verify everything is green
-git tag -d v0.0.N  2>/dev/null; git tag v0.0.N && git push origin v0.0.N --force
+cargo clippy --all-targets -- -D warnings && cargo test && cargo build --release
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-The tag triggers the GitHub release workflow (`.github/workflows/release.yml`)
-which builds binaries for x86_64, aarch64, and armv7 and attaches them to
-a GitHub Release. The tagged commit should always be the tip of `main`
-and should pass `cargo test`.
+The tag reaches GitHub via the mirror and triggers
+`.github/workflows/release.yml`, which cross-compiles x86_64, aarch64 and
+armv7 Linux binaries (aarch64/armv7 through `cross` using the images in
+`docker/`) and attaches them to a GitHub Release. The tagged commit
+should be the tip of `main`.
+
+Don't force-move a published tag; cut the next version instead —
+`install.sh` resolves the latest release, and re-pointing a tag makes
+already-installed boxes disagree about what they're running. Keep the tag
+in step with `version` in `Cargo.toml`.
+
+The release runners are Ubuntu 24.04, so published binaries need glibc
+2.38. That floor is what README's support table promises; lowering it
+means changing the base images in `docker/`.
 
 ## Architecture
 
@@ -87,6 +115,9 @@ One process owns the SDR (single-instance). Inside the process:
 - **`src/timefmt.rs`** — Portable Unix-seconds → ISO-8601 UTC
   formatting via Howard Hinnant's `civil_from_days` algorithm. No
   `gmtime_r`, so there's no libc dependency to vary across targets.
+- **`src/error.rs`** — One stringy `Error(String)` for the whole crate,
+  built with `Error::msg(..)`. There is no error enum and callers don't
+  match on variants; keep new failures as formatted context strings.
 - **`src/web/`** — Embedded HTML/CSS/JS (single page, no build step).
   Canvas waterfall, settings form bound to `/api/config`, live dBFS +
   measurement readouts, upload-status line.
@@ -97,6 +128,57 @@ One process owns the SDR (single-instance). Inside the process:
 `Measurement` reports **both** `signal_peak_dbfs` and `signal_avg_dbfs`
 on purpose: peak is for keyed/bursty signals (CW beacons), avg is for
 continuous carriers (FM/AM). Tests in `measure.rs` pin that contract.
+
+## Docs that are contracts, not commentary
+
+- **`api.md`** is the spec both halves of the system target. §1–§3 are the
+  LAN REST/WS/config surface, §4 is the microwaveprop ingest POST, §5 is
+  the config-sync protocol. Changing a payload shape in `uploader.rs` or
+  `sync.rs` without updating the matching section leaves microwaveprop
+  building against a stale contract.
+- **`output.md`** restates §4 for the microwaveprop implementers, down to
+  a sketch Elixir schema. It duplicates api.md by design and drifts by
+  accident — when the upload payload changes, both files need the edit.
+- **`README.md`** is operator-facing (supported OSes, supported dongles,
+  install, troubleshoot). Keep dev detail out of it; it belongs here.
+
+The three microwaveprop URLs are compile-time constants, not config:
+`MICROWAVEPROP_ENDPOINT` (`uploader.rs`) and `MICROWAVEPROP_SYNC_ENDPOINT`
+/ `_CONFIG_` / `_STATUS_ENDPOINT` (`sync.rs`). Every install reports to the
+same server; only the per-station credentials live in `config.yaml`.
+
+## Adding or renaming a config field
+
+The config schema is hand-maintained in more places than a serde struct
+would be, and one of them is bash. A new field usually means all of:
+
+1. `src/config.rs` — the struct field, its default, and validation.
+2. `src/yaml.rs` — both the parse side and the write side.
+3. `src/server.rs` — `ConfigView` (the LAN API shape) and `apply_config`.
+4. `src/sync.rs` — `SyncConfig`, *only* if microwaveprop should own the
+   field. Secrets and anything that could strand the LAN UI stay out.
+5. `src/web/` — the settings form, if an operator should be able to set it.
+6. `install.sh` — it reads and rewrites `config.yaml` with its own
+   line-oriented `yaml_get` / `yaml_put` / `yaml_set` bash helpers, which
+   know the field list by hand. A field the installer doesn't know is a
+   field first-run setup silently can't configure.
+7. `api.md` §3 (and §5 if synced), plus README's config sample.
+
+## Deployed layout
+
+`install.sh` puts the binary at `/usr/local/bin/propmonitor` (plus
+`sdr_diag`), config at `/etc/propmonitor/config.yaml` owned by a system
+user with mode 2770, and a hardened `propmonitor.service` systemd unit
+whose only `ReadWritePaths` is the config dir. Anything the daemon needs
+to write outside `/etc/propmonitor` has to be added to the unit.
+
+## Dependencies
+
+Keep TLS on rustls end to end — `reqwest` with `default-features = false`,
+`tokio-tungstenite` with `rustls-tls-webpki-roots`. No openssl anywhere;
+it would break the `cross` builds for aarch64/armv7. `tokio-tungstenite`
+is pinned to 0.29 so the sync client shares one tungstenite copy with
+axum's `ws` feature.
 
 ## Persistent vs ephemeral
 
