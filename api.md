@@ -1051,20 +1051,34 @@ release binary — the operator can still press Install.
 All file work happens in the running binary's own directory, so the final
 step is an atomic `rename(2)` within one filesystem:
 
-1. Download the asset for this architecture to
+1. **Already installed?** Hash the file at the install path. If it is
+   already the published build, the previous cycle installed it and only
+   failed to activate it — skip to step 6. Re-installing would rename that
+   same build to `propmonitor.prev`, overwriting the one generation of
+   backup with the build being installed.
+2. Download the asset for this architecture to
    `propmonitor.new.<pid>`, hashing the stream as it lands.
-2. Compare SHA-256 against the manifest. A mismatch aborts here — the
+3. Compare SHA-256 against the manifest. A mismatch aborts here — the
    temp file is deleted and the running binary is untouched.
-3. `chmod 0755`, `fsync`.
-4. **Preflight:** run the new binary against a config path that cannot
-   exist. It must fail during config load and say so; a build that dies for
-   any other reason (bad glibc, missing symbol) is refused. This is the
-   same probe `install.sh` runs after downloading a release.
-5. Rename the current binary to `propmonitor.prev`, rename the new one into
+4. `chmod 0755`, `fsync`.
+5. **Preflight:** run the new binary as
+   `propmonitor --check-config <the node's own config path>`. That mode
+   loads and validates the config, binds no port, opens no SDR, and exits.
+   Two failures are fatal and both are caught here: a build that cannot
+   start at all (bad glibc, missing symbol), and a build that starts and
+   then *rejects this node's config* — tightened validation, a key that
+   changed shape. The second is why the probe uses the real config: such a
+   build would swap in, `execve` fine, and then die during config load,
+   which `Restart=always` flaps forever while `propmonitor.prev` is never
+   restored. The probe has a 20 s deadline and is killed and reaped if it
+   overruns. Builds older than `--check-config` read it as a config path
+   and say so; those fall back to the older probe (a config path that
+   cannot exist) so republishing an earlier commit stays installable.
+6. Rename the current binary to `propmonitor.prev`, rename the new one into
    place, `fsync` the directory. A failed rename rolls the backup back.
-6. `execve(2)` the installed path with argv and environment carried over.
+7. `execve(2)` the installed path with argv and environment carried over.
 
-Step 6 is why this is smooth: **the PID does not change.** systemd sees no
+Step 7 is why this is smooth: **the PID does not change.** systemd sees no
 stop/start, the unit stays `active (running)`, and `Restart=`/start-limit
 accounting is untouched. The visible effect is what any restart does — the
 SDR is reopened, the in-memory ring buffer resets, WebSocket clients
@@ -1083,16 +1097,25 @@ the daemon reports it and asks systemd for a conventional restart.
 
 ### Rollback
 
-The previous binary is kept next to the current one:
+The previous binary is kept next to the current one. **Turn the channel off
+first:** a rolled-back node still sees the newer build, and with
+`update.auto: true` (the default) it reinstalls it within one
+`check_interval` — indistinguishable, to the operator, from the rollback
+not having worked.
 
 ```bash
+# 1. `update.auto: false` in /etc/propmonitor/config.yaml, or the
+#    auto-update toggle in Settings → software updates.
+# 2. Put the previous binary back:
 sudo -u propmonitor mv /opt/propmonitor/bin/propmonitor.prev \
                        /opt/propmonitor/bin/propmonitor
 sudo systemctl restart propmonitor
 ```
 
-Set `update.auto: false` first, or the node will re-install the newer build
-on its next check.
+`propmonitor.prev` is only ever written by a real install, and never with
+the build being installed (step 1 above), so it stays the last build that
+ran on this node.
+
 ---
 
 ## Versioning

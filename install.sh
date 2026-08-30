@@ -817,7 +817,11 @@ echo "    Re-run setup    : sudo bash install.sh"
 echo "    List SDR devices: SoapySDRUtil --find"
 echo "    Test the dongle : rtl_test -t"
 echo "    Status          : systemctl status ${SERVICE_NAME}"
-echo "    Roll back update: sudo -u ${SERVICE_USER} mv ${INSTALL_DIR}/propmonitor.prev ${INSTALL_DIR}/propmonitor && sudo systemctl restart ${SERVICE_NAME}"
+echo "    Roll back update: turn auto-update off first — Settings → software updates,"
+echo "                      or 'update.auto: false' in ${CONFIG} — or the node"
+echo "                      reinstalls the same build on its next check, then:"
+echo "                      sudo -u ${SERVICE_USER} mv ${INSTALL_DIR}/propmonitor.prev ${INSTALL_DIR}/propmonitor && sudo systemctl restart ${SERVICE_NAME}"
+echo "    Check a config  : ${INSTALL_DIR}/propmonitor --check-config ${CONFIG}"
 echo
 
 if (( ! HEALTHY )); then

@@ -25,6 +25,23 @@ use crate::uploader::{new_event_channel, UploaderStatus};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--check-config <path>`: load and validate that config, report, exit.
+    // Binds no port, opens no SDR, writes nothing. The self-update
+    // preflight (`src/update.rs`) runs every freshly downloaded binary this
+    // way against the node's live config — the only check that catches a
+    // build which would reject it and then crash-loop after activation.
+    if args.get(1).is_some_and(|a| a == "--check-config") {
+        let Some(config_path) = args.get(2) else {
+            eprintln!("propmonitor: --check-config needs a config path");
+            std::process::exit(2);
+        };
+        Config::load(config_path)
+            .with_context(|| format!("failed to load config from {}", config_path))?;
+        println!("propmonitor: config OK: {}", config_path);
+        return Ok(());
+    }
+
     let config_path = args
         .get(1)
         .cloned()

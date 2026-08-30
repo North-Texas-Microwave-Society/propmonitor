@@ -129,12 +129,17 @@ One process owns the SDR (single-instance). Inside the process:
   tokio task: GETs the fixed `latest`-release manifest, compares the
   manifest commit against `PROP_BUILD_COMMIT` baked in by `build.rs`, and
   on a difference downloads the arch asset next to the running binary,
-  verifies its SHA-256, preflights it (config-load probe, same as
-  `install.sh`), keeps the old one as `propmonitor.prev`, renames the new
-  one into place, and `execve`s it. Same PID, so systemd sees no restart.
-  Woken early by `AppState::update_notify` for the UI's check/install
-  buttons. Guards worth keeping: SHA mismatch aborts, unattended installs
-  require an official build, and non-Linux refuses outright.
+  verifies its SHA-256, preflights it (`propmonitor --check-config <the
+  node's own config>`, killed and reaped if it overruns 20 s), keeps the old
+  one as `propmonitor.prev`, renames the new one into place, and `execve`s
+  it. Same PID, so systemd sees no restart. Woken early by
+  `AppState::update_notify` for the UI's check/install buttons. Guards worth
+  keeping: SHA mismatch aborts; a build that rejects the live config is
+  refused (it would otherwise crash-loop the whole fleet under
+  `Restart=always`); a build already sitting at the install path is
+  activated rather than re-installed, so one generation of `propmonitor.prev`
+  survives a failed `execve`; unattended installs require an official build;
+  non-Linux refuses outright.
 - **`src/measure.rs`** — `SpectrumAnalyzer`: Hann-windowed FFT,
   fftshift on the fly, in-band peak + average tracking, median-of-out-
   of-passband noise floor with a guard region. `start_window(offset_hz,

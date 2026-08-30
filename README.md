@@ -171,18 +171,31 @@ With `auto: false` the node still tells you an update is waiting and leaves
 the decision to you.
 
 Something wrong with a new build? The previous binary is kept right next to
-the current one:
+the current one — but **turn auto-update off first.** A rolled-back node
+still sees the newer build on the channel, and with `auto: true` (the
+default) it reinstalls it on the next check, which looks exactly like the
+rollback having failed:
 
 ```bash
+# 1. Stop the channel: Settings → software updates → uncheck auto-update,
+#    or set `update.auto: false` in /etc/propmonitor/config.yaml.
+# 2. Put the previous binary back:
 sudo -u propmonitor mv /opt/propmonitor/bin/propmonitor.prev \
                        /opt/propmonitor/bin/propmonitor
 sudo systemctl restart propmonitor
 ```
 
-Turn `auto` off before rolling back, or the node will install the newer
-build again on its next check. Downloads are verified against a SHA-256
-published with the release and the new binary has to survive a startup
-probe, so a corrupted or broken download is refused rather than installed.
+Downloads are verified against a SHA-256 published with the release, and
+the new binary has to load this node's own config in a preflight run before
+it is installed — so a corrupted download, a build that cannot start on this
+system, and a build that would reject the config are all refused rather than
+installed.
+
+To check a config without starting anything:
+
+```bash
+/opt/propmonitor/bin/propmonitor --check-config /etc/propmonitor/config.yaml
+```
 
 ### Re-running the installer
 

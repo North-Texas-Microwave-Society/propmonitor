@@ -24,14 +24,18 @@
 //! restart does — the in-memory ring buffer resets and the SDR is
 //! reopened.
 //!
-//! Every failure here is non-fatal and retried on the next tick. The one
-//! hard gate is the SHA-256 check: a mismatch aborts the install and
-//! leaves the running binary in place.
+//! Every failure here is non-fatal and retried on the next tick. Two gates
+//! are hard, and both leave the running binary in place: the SHA-256 check,
+//! and the preflight run — the candidate has to load *this node's* config
+//! before it is allowed near the install path, because a build that rejects
+//! it would crash-loop the daemon with nothing left to roll back to.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,9 +79,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// residential uplink, with room to spare.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How long the new binary gets to fail its config-load preflight before
-/// we call it hung.
+/// How long the new binary gets to answer its config-load preflight before
+/// we call it hung, kill it, and refuse the install.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often the preflight thread looks in on the probe. Short enough that
+/// a normal probe (milliseconds) is not delayed by polling, long enough to
+/// cost nothing over the full deadline.
+const PROBE_POLL: Duration = Duration::from_millis(25);
 
 /// Identity of the running build, baked in by `build.rs`.
 #[derive(Debug, Clone, Serialize)]
@@ -408,6 +417,30 @@ async fn install(state: &Arc<AppState>, client: &reqwest::Client) {
         return;
     };
 
+    // A previous cycle may have already put this build at the install path
+    // and only failed to activate it (a refused `execve`). Installing again
+    // would rename that same build to `propmonitor.prev` — destroying the
+    // last known-good binary the rollback in the README depends on — and
+    // would re-download the asset every `check_interval` for as long as
+    // activation keeps failing. If the build is already on disk, activating
+    // it is all that is left to do.
+    let installed = {
+        let candidate = path.clone();
+        let want = expected_sha.clone();
+        tokio::task::spawn_blocking(move || already_installed(&candidate, &want))
+            .await
+            .unwrap_or(false)
+    };
+    if installed {
+        eprintln!(
+            "propmonitor: self-update: {} is already the published build; activating it",
+            path.display()
+        );
+        set_state(state, |s| s.phase = Phase::Installing).await;
+        activate(state, &path).await;
+        return;
+    }
+
     set_state(state, |s| s.phase = Phase::Downloading).await;
 
     let url = asset_url(&state.manifest_url, asset);
@@ -416,7 +449,17 @@ async fn install(state: &Arc<AppState>, client: &reqwest::Client) {
     // fight over one temp file.
     let tmp = dir.join(format!("propmonitor.new.{}", std::process::id()));
 
-    match download_and_verify(client, &url, &expected_sha, &path, dir, &tmp).await {
+    match download_and_verify(
+        client,
+        &url,
+        &expected_sha,
+        &path,
+        dir,
+        &tmp,
+        &state.config_path,
+    )
+    .await
+    {
         Ok(()) => {
             set_state(state, |s| s.phase = Phase::Installing).await;
             activate(state, &path).await;
@@ -440,6 +483,7 @@ async fn download_and_verify(
     path: &Path,
     dir: &Path,
     tmp: &Path,
+    config_path: &str,
 ) -> Result<(), String> {
     let mut resp = client
         .get(url)
@@ -495,39 +539,139 @@ async fn download_and_verify(
     }
 
     let probe = tmp.to_path_buf();
-    tokio::time::timeout(
-        PREFLIGHT_TIMEOUT,
-        tokio::task::spawn_blocking(move || preflight(&probe)),
-    )
-    .await
-    .map_err(|_| "new binary did not finish its preflight run in time".to_string())?
-    .map_err(|e| format!("preflight run could not be started: {e}"))??;
+    let config_path = config_path.to_string();
+    // `preflight` owns its own deadline and always reaps the probe, so
+    // there is no outer `tokio::time::timeout` here: one around
+    // `spawn_blocking` would abandon the future while `wait(2)` kept
+    // running, leaking a blocking thread and an orphan child per attempt.
+    tokio::task::spawn_blocking(move || preflight(&probe, &config_path, PREFLIGHT_TIMEOUT))
+        .await
+        .map_err(|e| format!("preflight run could not be started: {e}"))??;
 
     swap(path, dir, tmp)
 }
 
-/// Run the new binary against a config path that cannot exist.
+/// Prove the downloaded binary both runs on this system and accepts the
+/// config this node is actually running.
 ///
-/// A working build fails during config load — before it opens the SDR,
-/// binds a port, or writes anything — and says so on stderr. Anything
-/// else (a linker error, a missing glibc symbol, an immediate crash) is a
-/// build we refuse to swap in. This is the same probe `install.sh` runs
-/// after downloading a release.
-fn preflight(new_binary: &Path) -> Result<(), String> {
-    let out = std::process::Command::new(new_binary)
-        .arg("/nonexistent/propmonitor-preflight.yaml")
-        .output()
-        .map_err(|e| format!("the new binary will not start: {e}"))?;
+/// Two failures make an install fatal. A build that cannot start at all
+/// (bad glibc, missing symbol) is caught by anything that executes it. A
+/// build that starts but *rejects the live config* — tightened validation,
+/// a key that changed shape — is the dangerous one: the swap succeeds, the
+/// `execve` succeeds, and the new image then dies during config load, which
+/// `Restart=always` flaps forever while `propmonitor.prev` is never
+/// restored. Because every node polls the same manifest, that would take
+/// the fleet off the air within one `check_interval`.
+///
+/// `--check-config <path>` covers both: the candidate loads and validates
+/// the real config file, binds no port, and opens no SDR.
+fn preflight(new_binary: &Path, config_path: &str, timeout: Duration) -> Result<(), String> {
+    let probe = run_probe(new_binary, &["--check-config", config_path], timeout)?;
+    if probe.ok {
+        return Ok(());
+    }
+    // A build older than `--check-config` reads it as the config path and
+    // fails its load with that argument in the message. Refusing those
+    // would strand a fleet whenever the channel republishes an earlier
+    // commit, so they fall back to the probe they do understand.
+    if probe
+        .stderr
+        .contains("failed to load config from --check-config")
+    {
+        return legacy_preflight(new_binary, timeout);
+    }
+    // Covers both shapes of failure: a build that cannot start at all, and
+    // one that starts and then refuses this node's config.
+    Err(format!(
+        "the new binary failed its preflight run against {config_path}: {}",
+        excerpt(&probe.stderr)
+    ))
+}
 
-    if out.status.success() {
+/// The pre-`--check-config` probe: run the candidate against a config path
+/// that cannot exist. A working build fails during config load — before it
+/// opens the SDR, binds a port, or writes anything — and says so on
+/// stderr. This is the probe `install.sh` also runs after downloading a
+/// release.
+fn legacy_preflight(new_binary: &Path, timeout: Duration) -> Result<(), String> {
+    let probe = run_probe(
+        new_binary,
+        &["/nonexistent/propmonitor-preflight.yaml"],
+        timeout,
+    )?;
+    if probe.ok {
         return Err("the new binary accepted a config path that does not exist".to_string());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !stderr.contains("failed to load config from") {
-        let detail: String = stderr.trim().chars().take(300).collect();
-        return Err(format!("the new binary failed its preflight run: {detail}"));
+    if !probe.stderr.contains("failed to load config from") {
+        return Err(format!(
+            "the new binary failed its preflight run: {}",
+            excerpt(&probe.stderr)
+        ));
     }
     Ok(())
+}
+
+/// Outcome of one probe run: whether it exited successfully, and what it
+/// said on stderr.
+struct Probe {
+    ok: bool,
+    stderr: String,
+}
+
+/// Run the candidate binary with a hard deadline, and *always* reap it.
+///
+/// A probe that never exits is killed and waited for, so no orphan child
+/// and no stuck blocking thread survives the attempt — this runs once per
+/// `check_interval` forever, so a leak here is unbounded, and an orphan
+/// that did manage to start up would be a second daemon competing for the
+/// SDR.
+fn run_probe(binary: &Path, args: &[&str], timeout: Duration) -> Result<Probe, String> {
+    let mut child = std::process::Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("the new binary will not start: {e}"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut raw = Vec::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_end(&mut raw);
+                }
+                return Ok(Probe {
+                    ok: status.success(),
+                    stderr: String::from_utf8_lossy(&raw).into_owned(),
+                });
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("the new binary did not finish its preflight run in time".to_string());
+            }
+            Ok(None) => std::thread::sleep(PROBE_POLL),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for the preflight run: {e}"));
+            }
+        }
+    }
+}
+
+/// Enough of a probe's stderr to diagnose it from the UI or the journal,
+/// without pasting a whole backtrace into the update state.
+fn excerpt(stderr: &str) -> String {
+    let text: String = stderr.trim().chars().take(300).collect();
+    if text.is_empty() {
+        // A build that dies without a word still has to produce a usable
+        // line in `last_error`.
+        return "no output on stderr".to_string();
+    }
+    text
 }
 
 /// Publish the verified binary: keep the current one aside, rename the new
@@ -537,6 +681,11 @@ fn preflight(new_binary: &Path) -> Result<(), String> {
 /// old inode open for the live process (which is why the old binary keeps
 /// working until it execs). Writing *into* the running file is what would
 /// fail with `ETXTBSY`, and this never does that.
+///
+/// Whatever sits at `path` becomes `propmonitor.prev`, so the caller must
+/// not call this for a build that is already installed — [`install`] hashes
+/// the file first for exactly that reason, or the one generation of backup
+/// would be overwritten with the build being installed.
 fn swap(path: &Path, dir: &Path, tmp: &Path) -> Result<(), String> {
     let name = path
         .file_name()
@@ -566,6 +715,35 @@ fn swap(path: &Path, dir: &Path, tmp: &Path) -> Result<(), String> {
         let _ = handle.sync_all();
     }
     Ok(())
+}
+
+/// SHA-256 of a file, or `None` if it cannot be read.
+///
+/// Used to recognise a build that is already sitting at the install path.
+/// Blocking, so callers on the runtime hand it to `spawn_blocking`.
+fn file_sha256(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => return Some(hex_of(hasher.finalize())),
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Whether the build the manifest describes is already the file at the
+/// install path — the state a successful swap plus a failed `execve`
+/// leaves behind.
+///
+/// Case-insensitive, like the download's own digest check: the manifest is
+/// generated by `sha256sum` today, but nothing about the format promises
+/// lowercase.
+fn already_installed(path: &Path, expected_sha: &str) -> bool {
+    file_sha256(path).is_some_and(|sha| sha.eq_ignore_ascii_case(expected_sha))
 }
 
 /// Replace this process image with the freshly installed binary.
@@ -849,31 +1027,50 @@ mod tests {
         );
     }
 
+    /// Writes an executable stand-in for a downloaded build.
+    fn write_probe(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A stand-in build that behaves like a current one: it validates the
+    /// config path it is handed and says nothing.
+    const CHECKS_CONFIG: &[u8] = b"#!/bin/sh\n[ \"$1\" = \"--check-config\" ] && [ -f \"$2\" ] && exit 0\necho \"the config path was not checked: $*\" >&2\nexit 1\n";
+
     /// The whole file-level chain: download, hash, verify, preflight,
     /// back up, swap. Activation (`execve`) is deliberately not exercised
     /// — it would replace the test process.
     #[tokio::test]
     async fn download_and_verify_swaps_the_binary_and_keeps_a_backup() {
-        // A "binary" that behaves like the real one under preflight:
-        // non-zero exit, with the config-load message on stderr.
-        const NEW_BINARY: &[u8] =
-            b"#!/bin/sh\necho \"failed to load config from $1\" >&2\nexit 1\n";
-        let base = fake_channel(NEW_BINARY, String::new()).await;
+        let base = fake_channel(CHECKS_CONFIG, String::new()).await;
 
         let dir = TempDir::new("swap");
         let path = dir.join("propmonitor");
         std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         let tmp = dir.join("propmonitor.new.test");
-        let sha = hex_of(Sha256::digest(NEW_BINARY));
+        let sha = hex_of(Sha256::digest(CHECKS_CONFIG));
+        // The preflight has to be handed this, not a path that cannot
+        // exist: the probe above only passes if the file is really there.
+        let config = dir.join("config.yaml");
+        std::fs::write(&config, b"frequency: 28330000\n").unwrap();
 
         let client = reqwest::Client::new();
-        download_and_verify(&client, &format!("{base}/asset"), &sha, &path, &dir.0, &tmp)
-            .await
-            .expect("install chain");
+        download_and_verify(
+            &client,
+            &format!("{base}/asset"),
+            &sha,
+            &path,
+            &dir.0,
+            &tmp,
+            config.to_str().unwrap(),
+        )
+        .await
+        .expect("install chain");
 
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            NEW_BINARY,
+            CHECKS_CONFIG,
             "the new binary is at the install path"
         );
         assert_eq!(
@@ -902,6 +1099,7 @@ mod tests {
             &path,
             &dir.0,
             &tmp,
+            "/nonexistent/config.yaml",
         )
         .await
         .expect_err("a digest mismatch must abort the install");
@@ -932,15 +1130,141 @@ mod tests {
         let sha = hex_of(Sha256::digest(BROKEN));
 
         let client = reqwest::Client::new();
-        let err = download_and_verify(&client, &format!("{base}/asset"), &sha, &path, &dir.0, &tmp)
-            .await
-            .expect_err("a binary that cannot start must not be swapped in");
+        let err = download_and_verify(
+            &client,
+            &format!("{base}/asset"),
+            &sha,
+            &path,
+            &dir.0,
+            &tmp,
+            "/nonexistent/config.yaml",
+        )
+        .await
+        .expect_err("a binary that cannot start must not be swapped in");
 
         assert!(err.contains("preflight"), "unexpected error: {err}");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"#!/bin/sh\nexit 0\n",
             "the running binary is untouched"
+        );
+    }
+
+    /// The fleet-killer this preflight exists for: a build that starts
+    /// fine and then refuses the config the node is running. Installing it
+    /// would crash-loop the daemon under `Restart=always` with nothing
+    /// restoring `propmonitor.prev`.
+    #[tokio::test]
+    async fn download_and_verify_rejects_a_build_that_refuses_the_live_config() {
+        const PICKY: &[u8] = b"#!/bin/sh\necho 'Error: config: update.check_interval must be at least 60 seconds' >&2\nexit 1\n";
+        let base = fake_channel(PICKY, String::new()).await;
+
+        let dir = TempDir::new("liveconfig");
+        let path = dir.join("propmonitor");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        let tmp = dir.join("propmonitor.new.test");
+        let sha = hex_of(Sha256::digest(PICKY));
+        let config = dir.join("config.yaml");
+        std::fs::write(&config, b"frequency: 28330000\n").unwrap();
+
+        let client = reqwest::Client::new();
+        let err = download_and_verify(
+            &client,
+            &format!("{base}/asset"),
+            &sha,
+            &path,
+            &dir.0,
+            &tmp,
+            config.to_str().unwrap(),
+        )
+        .await
+        .expect_err("a build that rejects the live config must not be installed");
+
+        assert!(
+            err.contains("check_interval") && err.contains(config.to_str().unwrap()),
+            "the error must name the config and quote the build's complaint: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"#!/bin/sh\nexit 0\n",
+            "the running binary is untouched"
+        );
+        assert!(
+            !dir.join("propmonitor.prev").exists(),
+            "nothing was swapped, so nothing was backed up"
+        );
+    }
+
+    /// A build that predates `--check-config` reads it as a config path.
+    /// Refusing those would strand a fleet whenever the channel
+    /// republishes an earlier commit, so they get the older probe.
+    #[test]
+    fn preflight_accepts_builds_that_predate_check_config() {
+        let dir = TempDir::new("legacy");
+        let bin = dir.join("propmonitor.new");
+        write_probe(
+            &bin,
+            "#!/bin/sh\necho \"failed to load config from $1\" >&2\nexit 1\n",
+        );
+
+        preflight(&bin, "/nonexistent/config.yaml", Duration::from_secs(10))
+            .expect("an older build is still installable");
+    }
+
+    /// A probe that never exits is killed, not abandoned: the marker its
+    /// script would write afterwards must never appear, or the child (and
+    /// the blocking thread waiting on it) outlived the attempt.
+    #[test]
+    fn preflight_kills_a_probe_that_hangs() {
+        let dir = TempDir::new("hang");
+        let bin = dir.join("propmonitor.new");
+        let marker = dir.join("probe-finished");
+        write_probe(
+            &bin,
+            &format!(
+                "#!/bin/sh\nsleep 3\n: > {}\n",
+                marker.to_str().expect("temp path is utf-8")
+            ),
+        );
+
+        let started = Instant::now();
+        let err = preflight(&bin, "/nonexistent/config.yaml", Duration::from_millis(200))
+            .expect_err("a hung probe must fail the install");
+
+        assert!(err.contains("in time"), "unexpected error: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "preflight waited past its deadline"
+        );
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(
+            !marker.exists(),
+            "the probe kept running after preflight gave up"
+        );
+    }
+
+    #[test]
+    fn already_installed_recognises_the_build_on_disk() {
+        let dir = TempDir::new("installed");
+        let path = dir.join("propmonitor");
+        std::fs::write(&path, CHECKS_CONFIG).unwrap();
+        let sha = hex_of(Sha256::digest(CHECKS_CONFIG));
+
+        assert!(
+            already_installed(&path, &sha),
+            "a swapped-in build that failed to activate must be recognised"
+        );
+        assert!(
+            already_installed(&path, &sha.to_uppercase()),
+            "the manifest's digest case must not matter"
+        );
+        assert!(
+            !already_installed(&path, &hex_of(Sha256::digest(b"something else"))),
+            "a different build must still be downloaded"
+        );
+        assert!(
+            !already_installed(&dir.join("absent"), &sha),
+            "a missing file is not an installed build"
         );
     }
 

@@ -29,14 +29,17 @@ on:
   # Manual re-publish, e.g. after fixing a workflow without a code change.
   workflow_dispatch:
 
-# A newer push supersedes an in-flight one: the channel should carry the
-# newest main build, not whichever job happened to finish last.
-concurrency:
-  group: latest-channel
-  cancel-in-progress: true
-
 jobs:
   build:
+    # A newer push supersedes an in-flight build: the channel should carry
+    # the newest `main` build, not whichever run happened to finish last.
+    # Keyed per target because a job-level group is shared by every matrix
+    # leg, and a shared cancelling group would have the legs killing each
+    # other.
+    concurrency:
+      group: latest-build-${{ matrix.target }}
+      cancel-in-progress: true
+
     strategy:
       fail-fast: false
       matrix:
@@ -144,6 +147,21 @@ jobs:
             ${{ matrix.artifact }}
 
   publish:
+    # Deliberately *not* cancellable. `gh release upload --clobber` deletes
+    # each asset before re-uploading it, and the manifest goes last, so a
+    # cancel mid-upload would leave the old manifest — old SHA-256s — beside
+    # new binaries: every node that is behind would fail its digest check
+    # once an hour until some later run published, and a fresh `install.sh`
+    # could 404 on a tarball that was deleted but never replaced.
+    #
+    # A superseded run is stopped upstream instead: its build legs are
+    # cancelled, so this job never starts. One that has already started
+    # finishes, and the newer run's publish queues behind it — leaving the
+    # newest build on the channel.
+    concurrency:
+      group: latest-publish
+      cancel-in-progress: false
+
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -219,8 +237,16 @@ jobs:
 
           # One release, updated in place: recreating it would break the
           # download URLs mid-flight for any node polling right now.
-          id=$(gh api "repos/${REPO}/releases/tags/latest" --jq .id 2>/dev/null || true)
-          if [[ -n "$id" ]]; then
+          #
+          # `gh api` still copies the response body to stdout on a non-2xx
+          # and skips --jq, so a 404 would otherwise land the whole error
+          # object in $id and PATCH a garbage URL. Take the id only from a
+          # successful call, and only if it is numeric.
+          id=""
+          if body=$(gh api "repos/${REPO}/releases/tags/latest" 2>/dev/null); then
+            id=$(jq -r '.id // empty' <<<"$body")
+          fi
+          if [[ "$id" =~ ^[0-9]+$ ]]; then
             gh api -X PATCH "repos/${REPO}/releases/${id}" \
               -f name="latest (main)" -f body="$notes" -F prerelease=false -F draft=false >/dev/null
           else
