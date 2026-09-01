@@ -54,6 +54,32 @@ impl<T, E: fmt::Display> Context<T> for std::result::Result<T, E> {
     }
 }
 
+/// Render an error together with everything it wraps.
+///
+/// `reqwest::Error`'s `Display` is only the kind and the URL — "error
+/// sending request for url (https://…)". The part an operator needs ("dns
+/// error: Name or service not known", "invalid peer certificate: Expired",
+/// "tcp connect error: Connection refused") lives in the `source()` chain
+/// underneath it, so a bare `{e}` reports that a request failed and nothing
+/// about why. Same for `tungstenite::Error` around a TLS or io error.
+///
+/// Segments already present in the accumulated text are skipped: the
+/// hyper/rustls/io layers repeat each other's message verbatim often
+/// enough that the chain reads as "x: x: x" without it.
+pub fn chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(e) = source {
+        let segment = e.to_string();
+        if !out.contains(&segment) {
+            out.push_str(": ");
+            out.push_str(&segment);
+        }
+        source = e.source();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +133,69 @@ mod tests {
         // and exercises the bound from Debug.
         let e: Box<dyn std::error::Error> = Box::new(Error::msg("x"));
         assert_eq!(format!("{}", e), "x");
+    }
+
+    /// A two-level error, shaped like the reqwest → hyper → rustls chain
+    /// whose tail `Display` alone throws away.
+    #[derive(Debug)]
+    struct Layered {
+        message: &'static str,
+        inner: Option<Box<Layered>>,
+    }
+
+    impl fmt::Display for Layered {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for Layered {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.inner
+                .as_deref()
+                .map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn layered(messages: &[&'static str]) -> Layered {
+        let mut it = messages.iter().rev();
+        let last = it.next().expect("at least one message");
+        let mut error = Layered {
+            message: last,
+            inner: None,
+        };
+        for message in it {
+            error = Layered {
+                message,
+                inner: Some(Box::new(error)),
+            };
+        }
+        error
+    }
+
+    #[test]
+    fn chain_appends_every_source() {
+        let e = layered(&[
+            "error sending request for url (https://example.invalid/x)",
+            "client error (Connect)",
+            "invalid peer certificate: Expired",
+        ]);
+        assert_eq!(
+            chain(&e),
+            "error sending request for url (https://example.invalid/x): \
+             client error (Connect): invalid peer certificate: Expired"
+        );
+    }
+
+    #[test]
+    fn chain_skips_repeated_segments() {
+        // io::Error re-Displayed by each wrapper is the common case.
+        let e = layered(&["connection refused", "connection refused"]);
+        assert_eq!(chain(&e), "connection refused");
+    }
+
+    #[test]
+    fn chain_of_a_leaf_error_is_its_display() {
+        assert_eq!(chain(&Error::msg("no sources here")), "no sources here");
     }
 }

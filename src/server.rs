@@ -2007,6 +2007,11 @@ mod tests {
 
     /// An unreachable channel is reported, not fatal — and the next check
     /// is still allowed to run.
+    ///
+    /// The message has to name the transport failure: `reqwest::Error`'s
+    /// own `Display` stops at "error sending request for url (…)", which
+    /// tells an operator that something failed and nothing about what, so
+    /// the reported string must carry the wrapped cause too.
     #[tokio::test]
     async fn a_failed_check_surfaces_an_error_and_stays_idle() {
         // Port 1 on loopback: refused immediately, no waiting.
@@ -2018,6 +2023,10 @@ mod tests {
             let (_, v) = get_json(state.clone(), "/api/update").await;
             if let Some(err) = v["last_error"].as_str() {
                 assert!(err.contains("release channel"), "unexpected error: {err}");
+                assert!(
+                    err.contains("Connection refused") || err.contains("os error 61"),
+                    "error dropped the transport cause: {err}"
+                );
                 assert_eq!(v["phase"], "idle");
                 break;
             }

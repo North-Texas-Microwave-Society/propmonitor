@@ -1026,12 +1026,12 @@ directory — so a fork that publishes its own channel is one setting, not
 three. `PROPMONITOR_MANIFEST_URL` overrides the manifest URL for a staging
 channel or a local test; unset on a normal install.
 
-The `latest` git tag is cosmetic — it exists so the release page shows real
-contents. Assets are addressed by the release's tag name, not by the tag
-ref, and the publish job verifies the manifest URL is serving the new
-commit before it passes. A node that gets a 404 or an unreadable manifest
-records it in `last_error` and retries on the next tick; nothing is
-installed on a failed check.
+The `latest` git tag is load-bearing: GitHub drafts the release if the tag
+ref is deleted, and a draft serves no assets, so the URL nodes poll 404s
+until the release is published again. The publish job verifies the manifest
+URL is serving the new commit before it passes. A node that gets a 404 or an
+unreadable manifest records it in `last_error` and retries on the next tick;
+nothing is installed on a failed check.
 
 ### Identity is the commit, not the version
 

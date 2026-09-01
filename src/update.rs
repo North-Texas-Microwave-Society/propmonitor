@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::config::MIN_CHECK_INTERVAL;
+use crate::error;
 use crate::server::{AppState, WsEvent};
 use crate::timefmt;
 
@@ -78,6 +79,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Overall timeout for one asset download. A few MB over a slow
 /// residential uplink, with room to spare.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How soon a *failed* check is retried, before doubling.
+///
+/// The daemon checks the channel once at startup, and `Restart=always`
+/// plus a router that is still coming up after a power cut means that
+/// first check can land before the node has working DNS. At the
+/// configured interval alone — an hour by default — one such miss leaves
+/// a red "could not reach the release channel" in the UI for the whole
+/// hour and delays a build the node could have had in seconds.
+const FIRST_RETRY: Duration = Duration::from_secs(30);
 
 /// How long the new binary gets to answer its config-load preflight before
 /// we call it hung, kill it, and refuse the install.
@@ -281,7 +292,10 @@ pub async fn run(state: Arc<AppState>) {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("propmonitor: self-update disabled: HTTP client setup failed: {e}");
+            eprintln!(
+                "propmonitor: self-update disabled: HTTP client setup failed: {}",
+                error::chain(&e)
+            );
             return;
         }
     };
@@ -290,6 +304,9 @@ pub async fn run(state: Arc<AppState>) {
     // The first check runs immediately: a UI opened right after boot
     // should show a real answer, not "never checked".
     let mut wait = Duration::ZERO;
+    // Set while the last check failed, so the next one comes sooner than
+    // the configured interval.
+    let mut retry: Option<Duration> = None;
 
     loop {
         let request = tokio::select! {
@@ -316,16 +333,53 @@ pub async fn run(state: Arc<AppState>) {
             continue;
         }
 
-        let available = check(&state, &client).await;
-        if request == UpdateRequest::Install || (available && auto && auto_allowed()) {
-            install(&state, &client).await;
+        match check(&state, &client).await {
+            Checked::Failed => {
+                // Sooner than the configured interval, and the error the
+                // check recorded stays in the UI until it clears. An
+                // explicit install request has nothing to install here.
+                let delay = retry_delay(retry, wait);
+                retry = Some(delay);
+                wait = delay;
+            }
+            outcome => {
+                retry = None;
+                if request == UpdateRequest::Install
+                    || (outcome == Checked::Available && auto && auto_allowed())
+                {
+                    install(&state, &client).await;
+                }
+            }
         }
     }
 }
 
-/// Fetch the channel manifest and record what it says. Returns whether the
-/// channel offers a build other than the running one.
-async fn check(state: &Arc<AppState>, client: &reqwest::Client) -> bool {
+/// Outcome of one channel check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checked {
+    /// The channel could not be read; `last_error` says why, and the next
+    /// check comes after [`retry_delay`] rather than a full interval.
+    Failed,
+    /// The channel offers the build that is already running.
+    UpToDate,
+    /// The channel offers a different build.
+    Available,
+}
+
+/// Delay before retrying a failed check: [`FIRST_RETRY`], then doubling,
+/// capped at the configured interval — a channel that is genuinely down
+/// ends up polled no harder than a healthy one, while a node that came up
+/// before its network did recovers in seconds.
+fn retry_delay(previous: Option<Duration>, interval: Duration) -> Duration {
+    match previous {
+        None => FIRST_RETRY,
+        Some(d) => d.saturating_mul(2),
+    }
+    .min(interval)
+}
+
+/// Fetch the channel manifest and record what it says.
+async fn check(state: &Arc<AppState>, client: &reqwest::Client) -> Checked {
     let url = state.manifest_url.clone();
     set_state(state, |s| {
         s.phase = Phase::Checking;
@@ -335,23 +389,30 @@ async fn check(state: &Arc<AppState>, client: &reqwest::Client) -> bool {
 
     let manifest = match client.get(&url).send().await {
         Err(e) => {
-            fail(state, format!("could not reach the release channel: {e}")).await;
-            return false;
+            fail(
+                state,
+                format!("could not reach the release channel: {}", error::chain(&e)),
+            )
+            .await;
+            return Checked::Failed;
         }
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             fail(state, format!("release channel answered HTTP {status}")).await;
-            return false;
+            return Checked::Failed;
         }
         Ok(resp) => match resp.json::<Manifest>().await {
             Ok(m) => m,
             Err(e) => {
                 fail(
                     state,
-                    format!("release channel manifest is unreadable: {e}"),
+                    format!(
+                        "release channel manifest is unreadable: {}",
+                        error::chain(&e)
+                    ),
                 )
                 .await;
-                return false;
+                return Checked::Failed;
             }
         },
     };
@@ -363,7 +424,11 @@ async fn check(state: &Arc<AppState>, client: &reqwest::Client) -> bool {
         s.last_check_at = Some(timefmt::format_utc_iso8601(timefmt::unix_now_secs()));
     })
     .await;
-    available
+    if available {
+        Checked::Available
+    } else {
+        Checked::UpToDate
+    }
 }
 
 /// Download, verify and activate the build recorded by the last check.
@@ -489,7 +554,7 @@ async fn download_and_verify(
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("could not download the new binary: {e}"))?;
+        .map_err(|e| format!("could not download the new binary: {}", error::chain(&e)))?;
     if !resp.status().is_success() {
         return Err(format!(
             "new binary download failed: HTTP {}",
@@ -510,7 +575,12 @@ async fn download_and_verify(
                 hasher.update(&chunk);
             }
             Ok(None) => break,
-            Err(e) => return Err(format!("new binary download interrupted: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "new binary download interrupted: {}",
+                    error::chain(&e)
+                ))
+            }
         }
     }
     // Both flushes matter: the bytes have to be on the device before the
@@ -918,6 +988,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_first_failure_retries_within_the_minute() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(retry_delay(None, hour), FIRST_RETRY);
+    }
+
+    #[test]
+    fn repeated_failures_back_off_up_to_the_configured_interval() {
+        let interval = Duration::from_secs(600);
+        let mut delay = retry_delay(None, interval);
+        let mut seen = vec![delay];
+        for _ in 0..8 {
+            delay = retry_delay(Some(delay), interval);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            [30, 60, 120, 240, 480, 600, 600, 600, 600]
+                .map(Duration::from_secs)
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn a_retry_never_polls_faster_than_the_interval_floor() {
+        // `check_interval` is floored at 60 s, but an interval shorter than
+        // the first retry must still cap it rather than the other way
+        // round: the retry path may not out-poll the healthy path.
+        let interval = Duration::from_secs(10);
+        assert_eq!(retry_delay(None, interval), interval);
+        assert_eq!(retry_delay(Some(interval), interval), interval);
     }
 
     /// Serves one asset body at `/asset` and one manifest at `/manifest`.

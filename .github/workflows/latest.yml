@@ -13,14 +13,15 @@ name: Latest
 # (src/update.rs) and `install.sh` keeps resolving "latest release" to the
 # same build a self-updated node would land on.
 #
-# The `latest` git tag is pointed at the pushed commit so the release page
-# shows real contents. That tag is cosmetic, and deliberately so: this
-# repository receives a push-mirror from a private Forgejo instance, and
-# mirror syncs prune refs that do not exist upstream — so a tag created
-# here can be deleted again between pushes. The channel therefore depends
-# on the *release*, never on the tag: assets are addressed by the release's
-# tag_name string, and the final step of this job proves the URL nodes poll
-# actually serves this build before the job is allowed to pass.
+# The `latest` git tag is load-bearing, not cosmetic: GitHub turns a release
+# into a *draft* the moment its tag ref disappears, and a draft serves no
+# assets — the URL every node polls then 404s until someone republishes.
+# This repository receives a push-mirror from a private Forgejo instance,
+# and a mirror sync deletes refs the upstream does not have, so the tag is
+# pinned on Forgejo (`git tag latest <sha> && git push origin latest`) and
+# only created here when it is missing. It is deliberately never moved: a
+# mirror sync would reset it anyway, and the release notes carry the commit
+# the assets were actually built from.
 
 on:
   push:
@@ -203,27 +204,23 @@ jobs:
 
           cat propmonitor-manifest.json
 
-      # Done through the refs API rather than `git push`: it is idempotent
-      # (create or force-update in one call), needs no git credential
-      # juggling, and fails with a readable JSON error instead of a
-      # transport one. Non-fatal by design — see the note at the top of
-      # this file on why the tag is cosmetic.
-      - name: Point the `latest` tag at this commit
+      # Idempotent, and create-only. Moving the tag would be churn the next
+      # mirror sync undoes; what matters is that the ref exists at all, so
+      # GitHub keeps the release published (see the note at the top of this
+      # file).
+      - name: Make sure the `latest` tag exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           COMMIT: ${{ github.sha }}
         run: |
           if gh api "repos/${REPO}/git/refs/tags/latest" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${REPO}/git/refs/tags/latest" \
-              -f sha="$COMMIT" -F force=true >/dev/null \
-              && echo "moved the 'latest' tag to ${COMMIT}" \
-              || echo "::warning::could not move the 'latest' tag; release assets are unaffected"
+            echo "the 'latest' tag is in place"
           else
             gh api -X POST "repos/${REPO}/git/refs" \
               -f ref="refs/tags/latest" -f sha="$COMMIT" >/dev/null \
               && echo "created the 'latest' tag at ${COMMIT}" \
-              || echo "::warning::could not create the 'latest' tag; release assets are unaffected"
+              || echo "::warning::could not create the 'latest' tag; the release publish below recreates it"
           fi
 
       - name: Publish the `latest` release
@@ -238,21 +235,29 @@ jobs:
           # One release, updated in place: recreating it would break the
           # download URLs mid-flight for any node polling right now.
           #
-          # `gh api` still copies the response body to stdout on a non-2xx
-          # and skips --jq, so a 404 would otherwise land the whole error
-          # object in $id and PATCH a garbage URL. Take the id only from a
-          # successful call, and only if it is numeric.
-          id=""
-          if body=$(gh api "repos/${REPO}/releases/tags/latest" 2>/dev/null); then
-            id=$(jq -r '.id // empty' <<<"$body")
+          # The lookup lists releases instead of asking
+          # `releases/tags/latest`, because that endpoint does not return
+          # *draft* releases — and a draft is exactly what a mirror prune of
+          # the tag leaves behind. A by-tag lookup therefore misses the
+          # release that already exists and mints a second one, leaving two
+          # releases claiming one tag and one set of asset names, with
+          # `gh release upload latest` free to pick either.
+          ids=$(gh api "repos/${REPO}/releases" --paginate \
+                  --jq '.[] | select(.tag_name == "latest") | .id')
+          count=$(grep -c . <<<"$ids" || true)
+          if [[ "$count" -gt 1 ]]; then
+            echo "::error::$(tr '\n' ' ' <<<"$ids")are all tagged 'latest'; delete the stale ones and re-run"
+            exit 1
           fi
+          id=$(head -n1 <<<"$ids")
           if [[ "$id" =~ ^[0-9]+$ ]]; then
+            # draft=false on every run: GitHub drafts the release whenever a
+            # mirror sync prunes its tag, and a draft serves no assets.
             gh api -X PATCH "repos/${REPO}/releases/${id}" \
               -f name="latest (main)" -f body="$notes" -F prerelease=false -F draft=false >/dev/null
           else
             # target_commitish only matters here: GitHub uses it to create
-            # the tag if the ref is missing, which is exactly the state a
-            # mirror prune leaves behind.
+            # the tag if the ref is missing.
             gh api -X POST "repos/${REPO}/releases" \
               -f tag_name=latest -f target_commitish="$COMMIT" \
               -f name="latest (main)" -f body="$notes" \

@@ -76,14 +76,27 @@ update identity and as the "official build" flag that gates unattended
 updates. `Cross.toml` passes it into the cross containers — drop that and
 cross-built binaries silently become `dev` builds that never auto-update.
 
-The `latest` tag is cosmetic and may flap. The workflow points it at each
-pushed commit through the GitHub refs API so the release page shows real
-contents, but the Forgejo→GitHub push mirror prunes refs it doesn't have,
-so a tag created by CI can vanish until the next push recreates it. The
-channel is addressed by the *release*, never the tag; the publish job's
-last step curls the manifest URL nodes actually poll and fails if it isn't
-serving the new commit, so a broken channel is a red build rather than a
-field problem.
+The `latest` tag is load-bearing, and the Forgejo→GitHub push mirror is out
+to delete it. GitHub converts a release into a **draft** the moment its tag
+ref disappears, and a draft serves no assets — so a mirror sync that prunes
+`refs/tags/latest` (it prunes every ref the upstream doesn't have) takes the
+whole channel offline: `releases/download/latest/...` 404s on every node and
+`install.sh` silently falls back to the newest *version* tag, which predates
+self-update. That happened between 2026-08-30 and 2026-09-01.
+
+The tag is therefore pinned on **Forgejo** (`git tag latest <sha> && git
+push origin latest`), so a mirror sync force-updates it instead of deleting
+it, and `latest.yml` only creates it when it is missing — never moves it,
+since the mirror would undo the move and the release notes carry the commit
+the assets were built from. Keep that tag on origin; deleting it re-arms the
+failure.
+
+Two consequences for the publish job: it looks the release up by *listing*
+releases (`releases/tags/latest` does not return drafts, so a by-tag lookup
+misses a drafted channel and mints a duplicate release for the same tag),
+and it sets `draft=false` on every run. Its last step curls the manifest URL
+nodes actually poll and fails if it isn't serving the new commit, so a
+broken channel is a red build rather than a field problem.
 
 Don't force-move a published *version* tag; cut the next version instead.
 Keep version tags in step with `version` in `Cargo.toml` — the manifest

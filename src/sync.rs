@@ -36,7 +36,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::config::Config;
-use crate::error::Error;
+use crate::error::{chain, Error};
 use crate::server::{
     apply_config, persist_config_version, AppState, BeaconUpdate, ConfigUpdate, HttpUpdate,
     MicrowavepropUpdate,
@@ -456,7 +456,7 @@ async fn connect(token: &str) -> Result<WsStream, Error> {
 
     let (ws, _response) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| Error::msg(format!("{}: {}", MICROWAVEPROP_SYNC_ENDPOINT, e)))?;
+        .map_err(|e| Error::msg(format!("{}: {}", MICROWAVEPROP_SYNC_ENDPOINT, chain(&e))))?;
     Ok(ws)
 }
 
@@ -705,7 +705,7 @@ async fn pull_config(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| Error::msg(e.to_string()))?;
+        .map_err(|e| Error::msg(chain(&e)))?;
 
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(());
@@ -741,7 +741,7 @@ async fn post_report(
         .json(&body)
         .send()
         .await
-        .map_err(|e| Error::msg(e.to_string()))?;
+        .map_err(|e| Error::msg(chain(&e)))?;
     if !response.status().is_success() {
         return Err(Error::msg(format!(
             "POST config: HTTP {}",
@@ -768,7 +768,7 @@ async fn post_status(
         .json(&body)
         .send()
         .await
-        .map_err(|e| Error::msg(e.to_string()))?;
+        .map_err(|e| Error::msg(chain(&e)))?;
     if !response.status().is_success() {
         return Err(Error::msg(format!(
             "POST status: HTTP {}",
