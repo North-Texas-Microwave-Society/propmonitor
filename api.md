@@ -305,13 +305,29 @@ Connect to `/ws`. All frames are **JSON text frames**, one event per frame,
 tagged by `"type"`. The server pushes; the client never sends application
 frames.
 
+### Connect snapshot
+
+A client that connects mid-run — including one reconnecting after a dropped
+socket or a self-update restart — is sent the current state before the live
+stream begins, so nothing renders as a placeholder while it waits for the
+next worker event (up to a full `period_seconds`):
+
+| Frame | Sent when |
+|---|---|
+| `device_info` | the worker has come up |
+| `raw_level` | a raw level has been measured |
+| `measurement` | at least one window has completed |
+| `upload` | at least one POST has been attempted |
+| `config` | always |
+
+The snapshot is the whole reason a page never needs reloading: everything
+it shows either arrives here or arrives as a live frame below. The one
+exception is `GET /api/update`, whose `current` build changes when the
+daemon re-executes itself — clients re-read it on every connect.
+
 ### Event types
 
-#### `device_info` — emitted once when the worker comes up, and replayed to every new client
-
-A client that connects mid-run immediately receives the last `device_info`
-rather than waiting for the next worker restart, so headers render on the
-first frame.
+#### `device_info` — emitted once when the worker comes up, and in every connect snapshot
 
 ```json
 {
@@ -426,12 +442,50 @@ A client that joins mid-install gets no replay of earlier phases; fetch
 After an `installing` phase the daemon re-executes: expect the WebSocket to
 drop and reconnect onto the new build.
 
+#### `config` — emitted whenever the active config changes
+
+```json
+{
+  "type": "config",
+  "config": { "frequency": 28330000, "mode": "beacon", "…": "…" }
+}
+```
+
+`config` is exactly the `GET /api/config` body, `monitor_token` included as
+the `"redacted"` sentinel. Sent on connect and after **every** applied
+config change, whichever surface made it: this client, another browser on
+the LAN, a script against `PUT /api/config`, or a config pushed down by
+microwaveprop (§5). A version-only update (§5's content-identical push)
+changes nothing observable and emits no frame.
+
+A client that renders a settings form should treat this as authoritative
+unless the operator has unsaved edits in it — overwriting half-typed input
+is worse than showing it stale, so the web UI announces the change instead.
+
+#### `heartbeat` — liveness, every 10 s per client
+
+```json
+{ "type": "heartbeat", "at": "2026-05-13T15:30:00Z" }
+```
+
+Carries no state. It exists so that silence means something: a client can
+treat a socket with no frames for ~2.5 heartbeats as dead and redial,
+without mistaking a quiet worker (SDR unplugged, no measurements yet) for
+a lost connection. It also gives the server a periodic write on an idle
+socket, which is how a browser that vanished without a close frame gets
+noticed and dropped.
+
 ### Reconnection
 
 When `PUT /api/config` triggers a worker restart, the WebSocket stream pauses
 briefly but does not close. The client sees a new `device_info` event when
-the new worker is ready. If the connection drops for any reason, clients
-should reconnect with exponential backoff.
+the new worker is ready.
+
+If the connection drops, reconnect and re-read `GET /api/update`; the connect
+snapshot restores everything else. Because a half-open socket (suspended
+laptop, NAT timeout) is never reported as closed, don't wait for a close
+event alone — the web UI redials after 25 s without a frame, which the 10 s
+`heartbeat` makes a reliable signal.
 
 ---
 

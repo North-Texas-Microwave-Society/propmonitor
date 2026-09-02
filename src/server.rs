@@ -30,6 +30,14 @@ use crate::worker::{run_worker, WorkerEvent};
 /// gap; that's normal during waterfall bursts.
 const BROADCAST_CAPACITY: usize = 256;
 
+/// How often each connected client gets a heartbeat frame. The browser
+/// treats a silent socket as a dead one and redials, so this has to keep
+/// arriving even when the worker has nothing to say — an SDR that failed
+/// to open must not look like a lost connection. It also gives the
+/// server a write on an otherwise idle socket, which is how a client
+/// that vanished without a close frame gets noticed and dropped.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Tagged JSON events sent to WebSocket clients. The "type" field is the
 /// discriminator the browser uses to dispatch.
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +84,20 @@ pub enum WsEvent {
         phase: Phase,
         latest: Option<Manifest>,
         error: Option<String>,
+    },
+    /// The active config, exactly as `GET /api/config` renders it (token
+    /// redacted). Sent in the connect snapshot and after every applied
+    /// config change, whoever made it — the LAN UI in another browser, a
+    /// `curl` against `PUT /api/config`, or a push from microwaveprop —
+    /// so an open page never shows settings the daemon has moved on from.
+    Config {
+        config: ConfigView,
+    },
+    /// Liveness only, every [`HEARTBEAT`]. Carries no state; a client
+    /// uses its arrival to tell "the daemon is there and the SDR is
+    /// quiet" from "this socket is gone".
+    Heartbeat {
+        at: String,
     },
 }
 
@@ -260,8 +282,11 @@ async fn asset_css() -> Response {
         .into_response()
 }
 
-#[derive(Serialize)]
-struct ConfigView {
+/// The LAN API's rendering of the active config. `pub` (with private
+/// fields) because it rides along in `WsEvent::Config`; nothing outside
+/// this module constructs or reads one.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigView {
     frequency: f64,
     mode: String,
     driver: String,
@@ -275,27 +300,27 @@ struct ConfigView {
     update: UpdateView,
 }
 
-#[derive(Serialize)]
-struct BeaconView {
+#[derive(Debug, Clone, Serialize)]
+pub struct BeaconView {
     offset_hz: f64,
     bandwidth_hz: f64,
 }
 
-#[derive(Serialize)]
-struct HttpView {
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpView {
     bind: String,
 }
 
-#[derive(Serialize)]
-struct MicrowavepropView {
+#[derive(Debug, Clone, Serialize)]
+pub struct MicrowavepropView {
     enabled: bool,
     monitor_token: String, // always "redacted" on output
     beacon_id: String,
     gridsquare: String,
 }
 
-#[derive(Serialize)]
-struct UpdateView {
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateView {
     enabled: bool,
     auto: bool,
     check_interval: u32,
@@ -453,28 +478,63 @@ pub async fn apply_config(
             .map_err(ApplyError::Internal)?;
     }
 
-    crate::yaml::write_atomic(&state.config_path, &yaml).map_err(ApplyError::Internal)?;
+    write_config_file(&state.config_path, &yaml)
+        .await
+        .map_err(ApplyError::Internal)?;
 
     {
         let mut active = state.config.write().await;
         *active = new_cfg.clone();
     }
-    restart_worker(state, &new_cfg);
+
+    // Tell every connected browser before the worker is torn down: the
+    // page that made this edit isn't necessarily the only one open, and a
+    // config pushed down by microwaveprop has no browser behind it at all.
+    let _ = state.broadcaster.send(WsEvent::Config {
+        config: cfg_to_view(&new_cfg),
+    });
+
+    restart_worker(state, &new_cfg).await;
 
     Ok(new_cfg)
 }
 
+/// `yaml::write_atomic` is blocking — write, `fsync`, rename — and both
+/// of its callers run on the tokio runtime. On the SD card a Pi boots
+/// from that `fsync` can stall for tens of milliseconds, which would
+/// hold up every other request the runtime thread was serving, so it
+/// goes to a blocking thread.
+async fn write_config_file(path: &str, yaml: &str) -> Result<(), Error> {
+    let path = path.to_string();
+    let yaml = yaml.to_string();
+    tokio::task::spawn_blocking(move || crate::yaml::write_atomic(&path, &yaml))
+        .await
+        .map_err(|e| Error::msg(format!("config write task failed: {}", e)))?
+}
+
 /// Stop the running worker + bridge and start a fresh pair on `cfg`. The
 /// SoapySDR device is released and reopened.
-fn restart_worker(state: &Arc<AppState>, cfg: &Config) {
-    let mut handle = state
+async fn restart_worker(state: &Arc<AppState>, cfg: &Config) {
+    // Take the old handle out under the lock and drop the guard before
+    // awaiting: joining waits for the SDR read loop to notice its stop
+    // flag (up to one stream read timeout), which has no business
+    // blocking a runtime thread — and a `std::sync::Mutex` guard has no
+    // business being held across an await either.
+    let old = state
         .worker_handle
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(mut h) = handle.take() {
-        h.stop_and_join();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut h) = old {
+        // Awaited before the replacement starts: the SoapySDR device has
+        // to be released before it can be reopened.
+        let _ = tokio::task::spawn_blocking(move || h.stop_and_join()).await;
     }
-    *handle = Some(spawn_worker_and_bridge(state.clone(), cfg.clone()));
+    let fresh = spawn_worker_and_bridge(state.clone(), cfg.clone());
+    *state
+        .worker_handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fresh);
 }
 
 /// Record a microwaveprop-minted config version without disturbing the
@@ -495,7 +555,7 @@ pub async fn persist_config_version(state: &Arc<AppState>, version: u64) -> Resu
     mw.config_version = version;
 
     let yaml = build_yaml_from_update(&cfg_to_update(&active), &active, Some(version))?;
-    crate::yaml::write_atomic(&state.config_path, &yaml)
+    write_config_file(&state.config_path, &yaml).await
 }
 
 async fn put_config(
@@ -790,32 +850,90 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
+/// Everything a page needs to render itself without waiting for the next
+/// worker event: the device the worker opened, the last raw level and
+/// completed measurement, the uploader's last result, and the active
+/// config. Ordinary events are only pushed as they happen, so without
+/// this a browser that connects mid-run (or reconnects after the daemon
+/// re-executed itself for an update) sits on placeholders for up to a
+/// whole integration period, and shows stale settings until reloaded.
+async fn snapshot_events(state: &Arc<AppState>) -> Vec<WsEvent> {
+    let mut out = Vec::new();
+    if let Some(ev) = state.device_info.read().await.clone() {
+        out.push(ev);
+    }
+    if let Some(dbfs) = *state.last_raw_dbfs.read().await {
+        out.push(WsEvent::RawLevel { dbfs });
+    }
+    if let Some(m) = state.store.read().await.last() {
+        out.push(WsEvent::Measurement {
+            measured_at: m.measured_at,
+            noise_floor_dbfs: m.noise_floor_dbfs,
+            signal_peak_dbfs: m.signal_peak_dbfs,
+            signal_avg_dbfs: m.signal_avg_dbfs,
+            snr_peak_db: m.snr_peak_db,
+            snr_avg_db: m.snr_avg_db,
+            signal_active_fraction: m.signal_active_fraction,
+        });
+    }
+    {
+        let s = state.uploader_status.read().await;
+        // Both are set together by the uploader; before the first POST
+        // there is nothing to report and the page keeps its placeholder.
+        if let (Some(at), Some(status)) = (s.last_post_at.clone(), s.last_status.clone()) {
+            out.push(WsEvent::Upload {
+                at,
+                status,
+                queued: s.queued,
+            });
+        }
+    }
+    let cfg = state.config.read().await;
+    out.push(WsEvent::Config {
+        config: cfg_to_view(&cfg),
+    });
+    drop(cfg);
+    out
+}
+
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
+    // Subscribe before snapshotting: an event that lands during the
+    // snapshot is then delivered by the loop below rather than lost in
+    // the gap between the two.
     let mut rx = state.broadcaster.subscribe();
 
-    // Replay the most recent device info so newly-connected clients have
-    // header data immediately rather than waiting for the next event.
-    if let Some(ev) = state.device_info.read().await.clone() {
+    for ev in snapshot_events(&state).await {
         if let Ok(s) = serde_json::to_string(&ev) {
-            let _ = socket.send(Message::Text(s.into())).await;
+            if socket.send(Message::Text(s.into())).await.is_err() {
+                return;
+            }
         }
     }
 
+    // Heartbeat and event delivery share the socket, so they share one
+    // task: two tasks writing to a `WebSocket` would need a lock around
+    // it for no gain. The first tick fires immediately — one extra frame
+    // behind the snapshot, which the client ignores.
+    let mut beat = tokio::time::interval(HEARTBEAT);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
-        match rx.recv().await {
-            Ok(ev) => match serde_json::to_string(&ev) {
-                Ok(s) => {
-                    if socket.send(Message::Text(s.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => continue,
+        let frame = tokio::select! {
+            recv = rx.recv() => match recv {
+                Ok(ev) => ev,
+                // Slow client; keep going from the latest available.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
             },
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // Slow client; just keep going from the latest available.
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+            _ = beat.tick() => WsEvent::Heartbeat {
+                at: crate::timefmt::format_utc_iso8601(crate::timefmt::unix_now_secs()),
+            },
+        };
+        let Ok(s) = serde_json::to_string(&frame) else {
+            continue;
+        };
+        if socket.send(Message::Text(s.into())).await.is_err() {
+            break;
         }
     }
 }
@@ -1407,6 +1525,18 @@ mod tests {
         assert!(s2.contains("\"type\":\"period_started\""), "got {}", s2);
     }
 
+    /// The browser dispatches on this tag and resets its dead-socket
+    /// timer when the frame lands, so the name is a contract.
+    #[test]
+    fn ws_event_heartbeat_serializes_with_its_tag() {
+        let ev = WsEvent::Heartbeat {
+            at: "2026-05-13T15:30:00Z".to_string(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "heartbeat");
+        assert_eq!(v["at"], "2026-05-13T15:30:00Z");
+    }
+
     #[test]
     fn ws_event_measurement_includes_active_fraction() {
         let ev = WsEvent::Measurement {
@@ -1602,6 +1732,94 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["last_raw_dbfs"], -42.0);
         assert_eq!(v["last_measurement"]["signal_active_fraction"], 0.5);
+    }
+
+    /// The connect snapshot is what keeps a freshly-opened (or
+    /// reconnected) page from sitting on placeholders until the next
+    /// integration period ends.
+    #[tokio::test]
+    async fn snapshot_events_replay_the_current_runtime_state() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        *state.device_info.write().await = Some(WsEvent::DeviceInfo {
+            actual_sample_rate: 250_000.0,
+            actual_frequency: 28_330_000.0,
+            actual_gain: 10.0,
+            gain_elements: vec!["TUNER".to_string()],
+        });
+        *state.last_raw_dbfs.write().await = Some(-42.0);
+        state
+            .store
+            .write()
+            .await
+            .push(crate::store::StoredMeasurement {
+                measured_at: "2026-05-13T15:30:00Z".to_string(),
+                noise_floor_dbfs: -110.0,
+                signal_peak_dbfs: -88.0,
+                signal_avg_dbfs: -89.0,
+                snr_peak_db: 22.0,
+                snr_avg_db: 21.0,
+                signal_active_fraction: 0.5,
+            });
+        *state.uploader_status.write().await = UploaderStatus {
+            enabled: true,
+            last_post_at: Some("2026-05-13T15:31:00Z".to_string()),
+            last_status: Some("ok".to_string()),
+            queued: 3,
+        };
+
+        let types: Vec<String> = snapshot_events(&state)
+            .await
+            .iter()
+            .map(|e| {
+                serde_json::to_value(e).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "device_info",
+                "raw_level",
+                "measurement",
+                "upload",
+                "config"
+            ]
+        );
+    }
+
+    /// Nothing has happened yet, but the page still needs its settings —
+    /// so the config frame is the one unconditional part of the snapshot,
+    /// and it must not carry the monitor token.
+    #[tokio::test]
+    async fn snapshot_events_always_include_a_redacted_config() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        let events = snapshot_events(&state).await;
+        assert_eq!(events.len(), 1, "got {:?}", events);
+        let v = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(v["type"], "config");
+        assert_eq!(v["config"]["frequency"], 28_330_000.0);
+        assert_eq!(v["config"]["microwaveprop"]["monitor_token"], "redacted");
+    }
+
+    /// A half-reported uploader (a status without a timestamp) would
+    /// render as `undefined` in the readout line; leave the placeholder.
+    #[tokio::test]
+    async fn snapshot_events_skip_upload_before_the_first_post() {
+        let state = test_state(sample_cfg(), "config.yaml");
+        *state.uploader_status.write().await = UploaderStatus {
+            enabled: true,
+            last_post_at: None,
+            last_status: Some("ok".to_string()),
+            queued: 0,
+        };
+        let events = snapshot_events(&state).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, WsEvent::Upload { .. })),
+            "got {:?}",
+            events
+        );
     }
 
     #[tokio::test]

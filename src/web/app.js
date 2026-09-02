@@ -198,9 +198,15 @@ async function loadUpdate() {
 }
 
 // The channel task pushes every transition, so an install started from
-// another browser tab (or by the timer) shows up here too.
+// another browser tab (or by the timer) shows up here too. Before the
+// first snapshot there is nothing to patch — fetch one rather than drop
+// the event, or a single failed fetch at boot would leave this section
+// dead until the operator reloads.
 function applyUpdateEvent(ev) {
-  if (!updateInfo) return;
+  if (!updateInfo) {
+    loadUpdate();
+    return;
+  }
   updateInfo.phase = ev.phase;
   updateInfo.latest = ev.latest;
   updateInfo.last_error = ev.error;
@@ -224,18 +230,72 @@ async function requestUpdate(path) {
   }
 }
 
+// The daemon sends a heartbeat every 10 s on top of whatever the worker
+// is producing, so a live socket is never quiet for long — even with the
+// SDR down. A suspended laptop, or a NAT that forgets the flow, can
+// leave a half-open socket the browser never reports as closed, and that
+// is the one failure this page cannot recover from on its own. So treat
+// silence past two missed beats as death and redial; the daemon replays
+// a full snapshot on connect, which makes a needless reconnect cost one
+// handshake and nothing else.
+const WS_SILENCE_MS = 25000;
+const WS_RETRY_MS = 1500;
+
 let ws = null;
+let silenceTimer = null;
+let retryTimer = null;
+
+function armSilenceTimer() {
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(() => {
+    // Don't wait for onclose: a dead socket can sit in CLOSING for a
+    // while. Detach it, forget it, dial again now.
+    dropSocket();
+    $("hdr-summary").textContent = "reconnecting…";
+    connectWS();
+  }, WS_SILENCE_MS);
+}
+
+function dropSocket() {
+  clearTimeout(silenceTimer);
+  const dead = ws;
+  ws = null;
+  if (!dead) return;
+  dead.onopen = dead.onmessage = dead.onclose = dead.onerror = null;
+  try { dead.close(); } catch (e) {}
+}
+
+function scheduleReconnect() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connectWS();
+  }, WS_RETRY_MS);
+}
+
 function connectWS() {
+  clearTimeout(retryTimer);
+  retryTimer = null;
   const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
-  ws = new WebSocket(url);
-  ws.onopen = () => {
+  const sock = new WebSocket(url);
+  ws = sock;
+  sock.onopen = () => {
     $("hdr-summary").textContent = "connected";
+    armSilenceTimer();
+    // The connect snapshot carries device, raw level, last measurement,
+    // uploader status and config. The update section is the exception:
+    // its state includes the *running* build, which a self-update swaps
+    // out from under an open page, so re-read it on every connect.
+    loadUpdate();
   };
-  ws.onclose = () => {
+  sock.onclose = () => {
+    if (ws !== sock) return; // superseded by a reconnect already in flight
+    clearTimeout(silenceTimer);
     $("hdr-summary").textContent = "disconnected — reconnecting…";
-    setTimeout(connectWS, 1500);
+    scheduleReconnect();
   };
-  ws.onmessage = (msg) => {
+  sock.onmessage = (msg) => {
+    armSilenceTimer();
     let ev;
     try { ev = JSON.parse(msg.data); } catch (e) { return; }
     switch (ev.type) {
@@ -245,12 +305,38 @@ function connectWS() {
       case "measurement": setReadout(ev); break;
       case "upload":      setUploadStatus(ev); break;
       case "update":      applyUpdateEvent(ev); break;
+      case "config":      onRemoteConfig(ev.config); break;
+      case "heartbeat": break; // liveness only; the timer above is the point
       case "period_started": break;
       case "error":       $("hdr-summary").textContent = "error: " + ev.message; break;
     }
   };
 }
 
+// Select `value` in the device dropdown, adding an entry for a device
+// that isn't currently plugged in so the form still reflects what the
+// daemon is configured with.
+function ensureDriverOption(value) {
+  const sel = $("settings-form").driver;
+  if (value && ![...sel.options].some((o) => o.value === value)) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = `${value} (not connected)`;
+    sel.appendChild(opt);
+  }
+  if (!sel.options.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "no SoapySDR devices found";
+    opt.disabled = true;
+    sel.appendChild(opt);
+  }
+  sel.value = value || "";
+}
+
+// Rescans USB, which costs a few hundred ms on the daemon — so only at
+// boot and when the operator presses ↻. A config arriving over the
+// WebSocket reuses the options already listed.
 async function loadDevices(selected) {
   const sel = $("settings-form").driver;
   // Preserve the currently-saved value so it stays available even when
@@ -269,60 +355,71 @@ async function loadDevices(selected) {
       }
     }
   } catch (e) {}
-
-  // If the saved value isn't in the live list, add it as a disconnected
-  // entry so the form still reflects what's on disk.
-  if (current && ![...sel.options].some((o) => o.value === current)) {
-    const opt = document.createElement("option");
-    opt.value = current;
-    opt.textContent = `${current} (not connected)`;
-    sel.appendChild(opt);
-  }
-  if (!sel.options.length) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "no SoapySDR devices found";
-    opt.disabled = true;
-    sel.appendChild(opt);
-  }
-  sel.value = current;
+  ensureDriverOption(current);
 }
 
+// True once the operator has typed in the settings form without saving.
+// A config that arrives mid-edit must not overwrite half-finished work,
+// so it gets announced instead of applied.
+let formDirty = false;
+
+function applyConfig(cfg) {
+  const f = $("settings-form");
+  ensureDriverOption(cfg.driver || "");
+  f.frequency.value = cfg.frequency || "";
+  f.mode.value = cfg.mode || "beacon";
+  f.sample_rate.value = cfg.sample_rate || 250000;
+  f.gain.value = cfg.gain != null ? cfg.gain : "";
+  f.ppm.value = cfg.ppm || 0;
+  // period_seconds is intentionally not in the form — it's a rarely-changed
+  // value (the upload cadence the microwaveprop rate-limit assumes). Edit
+  // config.yaml directly to override the 60 s default.
+  if (cfg.beacon) {
+    f.beacon_offset_hz.value = cfg.beacon.offset_hz;
+    f.beacon_bandwidth_hz.value = cfg.beacon.bandwidth_hz;
+    beaconOffsetHz = cfg.beacon.offset_hz;
+  }
+  f.http_bind.value = (cfg.http && cfg.http.bind) || "0.0.0.0:5760";
+  if (cfg.microwaveprop) {
+    f.mw_enabled.checked = cfg.microwaveprop.enabled !== false;
+    f.mw_token.value = cfg.microwaveprop.monitor_token || "";
+    f.mw_beacon_id.value = cfg.microwaveprop.beacon_id || "";
+    f.mw_gridsquare.value = cfg.microwaveprop.gridsquare || "";
+  } else {
+    f.mw_enabled.checked = false;
+  }
+  const up = cfg.update || {};
+  f.up_enabled.checked = up.enabled !== false;
+  f.up_auto.checked = up.auto !== false;
+  // Stored in seconds, shown in minutes: an hour is the useful unit here.
+  f.up_interval.value = Math.max(1, Math.round((up.check_interval || 3600) / 60));
+  formDirty = false;
+}
+
+// Boot path only — the WebSocket keeps the form current after this.
 async function loadConfig() {
   const r = await fetch("/api/config");
   if (!r.ok) return;
   const cfg = await r.json();
   await loadDevices(cfg.driver || "");
-  $("settings-form").frequency.value = cfg.frequency || "";
-  $("settings-form").mode.value = cfg.mode || "beacon";
-  $("settings-form").sample_rate.value = cfg.sample_rate || 250000;
-  $("settings-form").gain.value = cfg.gain != null ? cfg.gain : "";
-  $("settings-form").ppm.value = cfg.ppm || 0;
-  // period_seconds is intentionally not in the form — it's a rarely-changed
-  // value (the upload cadence the microwaveprop rate-limit assumes). Edit
-  // config.yaml directly to override the 60 s default.
-  if (cfg.beacon) {
-    $("settings-form").beacon_offset_hz.value = cfg.beacon.offset_hz;
-    $("settings-form").beacon_bandwidth_hz.value = cfg.beacon.bandwidth_hz;
-    beaconOffsetHz = cfg.beacon.offset_hz;
+  applyConfig(cfg);
+}
+
+// A `config` frame means the running config changed: another browser on
+// the LAN saved, something curled PUT /api/config, or microwaveprop
+// pushed a managed config down.
+function onRemoteConfig(cfg) {
+  // The marker tracks the daemon's passband rather than the form, so it
+  // moves whether or not the form is safe to touch.
+  if (cfg.beacon) beaconOffsetHz = cfg.beacon.offset_hz;
+  if (formDirty) {
+    setSaveStatus(
+      "settings changed on the monitor — save to overwrite, or reload to see them",
+      "err",
+    );
+    return;
   }
-  $("settings-form").http_bind.value = (cfg.http && cfg.http.bind) || "0.0.0.0:5760";
-  if (cfg.microwaveprop) {
-    $("settings-form").mw_enabled.checked = cfg.microwaveprop.enabled !== false;
-    $("settings-form").mw_token.value = cfg.microwaveprop.monitor_token || "";
-    $("settings-form").mw_beacon_id.value = cfg.microwaveprop.beacon_id || "";
-    $("settings-form").mw_gridsquare.value = cfg.microwaveprop.gridsquare || "";
-  } else {
-    $("settings-form").mw_enabled.checked = false;
-  }
-  const up = cfg.update || {};
-  $("settings-form").up_enabled.checked = up.enabled !== false;
-  $("settings-form").up_auto.checked = up.auto !== false;
-  // Stored in seconds, shown in minutes: an hour is the useful unit here.
-  $("settings-form").up_interval.value = Math.max(
-    1,
-    Math.round((up.check_interval || 3600) / 60),
-  );
+  applyConfig(cfg);
 }
 
 function setSaveStatus(text, cls) {
@@ -378,8 +475,10 @@ async function saveConfig(ev) {
   if (r.ok) {
     setSaveStatus("saved · worker restarting", "ok");
     setTimeout(() => setSaveStatus("", ""), 4000);
-    // Update beacon marker immediately so the next waterfall row reflects
-    // the new offset without needing to reload.
+    formDirty = false;
+    // The daemon broadcasts the config it applied, so this page and every
+    // other one open re-render from that frame. Move the marker now so
+    // the next waterfall row already uses the new offset.
     beaconOffsetHz = body.beacon.offset_hz;
   } else {
     let msg = "save failed";
@@ -392,7 +491,15 @@ function main() {
   initCanvas();
   loadConfig();
   loadUpdate();
-  $("settings-form").addEventListener("submit", saveConfig);
+  const form = $("settings-form");
+  form.addEventListener("submit", saveConfig);
+  // Anything typed or ticked makes the form the operator's, not the
+  // daemon's, until they save it.
+  const markDirty = () => {
+    formDirty = true;
+  };
+  form.addEventListener("input", markDirty);
+  form.addEventListener("change", markDirty);
   $("refresh-devices").addEventListener("click", () => loadDevices());
   $("btn-check").addEventListener("click", () => requestUpdate("/api/update/check"));
   $("btn-install").addEventListener("click", () => {
@@ -401,6 +508,18 @@ function main() {
       return;
     }
     requestUpdate("/api/update/install");
+  });
+  // A tab hidden while the laptop slept can come back holding a socket
+  // that is already gone; check on the way in instead of waiting out the
+  // silence timer.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      dropSocket();
+      connectWS();
+    } else {
+      armSilenceTimer();
+    }
   });
   connectWS();
 }

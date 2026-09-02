@@ -123,7 +123,10 @@ One process owns the SDR (single-instance). Inside the process:
   thread. The bridge reads `WorkerEvent`s from the mpsc, converts each
   to a `WsEvent`, updates derived state (`device_info`, `last_raw_dbfs`,
   `MeasurementStore`), and broadcasts on a `tokio::sync::broadcast` that
-  WS clients and the uploader subscribe to.
+  WS clients and the uploader subscribe to. `handle_ws` opens each client
+  with `snapshot_events` (device, raw level, last measurement, uploader
+  status, config) and then heartbeats every 10 s, so the LAN UI is
+  push-only: nothing it displays needs a page reload or a poll.
 - **`src/uploader.rs`** — Long-running tokio task. Subscribes to the
   broadcast, builds a JSON payload from each `Measurement` + the current
   config (callsign, frequency, passband), POSTs to microwaveprop with
@@ -175,7 +178,12 @@ One process owns the SDR (single-instance). Inside the process:
 - **`src/web/`** — Embedded HTML/CSS/JS (single page, no build step).
   Canvas waterfall, settings form bound to `/api/config`, live dBFS +
   measurement readouts, upload-status line, update status + check/install
-  buttons bound to `/api/update`.
+  buttons bound to `/api/update`. The page fetches at boot and then lives
+  off `/ws`: it redials after 25 s without a frame (the heartbeat makes
+  that mean "dead socket", not "quiet SDR"), re-reads `/api/update` on
+  every connect because a self-update changes the running build under it,
+  and re-renders the settings form from `config` frames — unless the
+  operator has unsaved edits, which are announced rather than clobbered.
 - **`src/bin/sdr_diag.rs`** — Standalone diagnostic CLI. Useful when
   the waterfall in the web UI looks wrong and you want to rule out the
   DSP/server path.
@@ -274,13 +282,23 @@ exists to avoid. Hex formatting is a six-line local helper rather than the
   `spawn_server` logs the actual bound address; don't add a second
   hardcoded-loopback log line next to it.
 - Config writes go through one path: `server::apply_config` (yaml build →
-  parse/validate → rebind if needed → write_atomic → swap → worker
-  restart). `PUT /api/config` and `sync.rs` both call it; don't grow a
-  second one. `put_config` bumps `sync_notify` afterwards so the edit is
+  parse/validate → rebind if needed → write_config_file → swap →
+  broadcast `WsEvent::Config` → worker restart). `PUT /api/config` and
+  `sync.rs` both call it; don't grow a second one. That single funnel is
+  what makes every open LAN page follow a config change it didn't make,
+  so a new write path has to broadcast too or it goes out silently.
+  `put_config` bumps `sync_notify` afterwards so the edit is
   reported upstream — a config that arrived *from* microwaveprop must not
   bump it, or the node and website mint versions at each other forever.
   Both writers (and `persist_config_version`) hold `AppState::config_write`
   for the whole read-modify-write; a new config writer must take it too.
+- Nothing blocking runs on the runtime. The config write (`write` +
+  `fsync` + `rename`, tens of ms on a Pi's SD card), the worker join in
+  `restart_worker` (waits out an SDR stream read), `enumerate_devices`
+  (scans USB), the update preflight and the binary swap all go through
+  `spawn_blocking`. A blocking call left inline stalls every other
+  request that runtime thread was serving — including the WS pushes the
+  UI depends on.
 - `microwaveprop.config_version` is bookkeeping owned by microwaveprop.
   The node persists and echoes it, never invents it. `persist_config_version`
   records a version *without* restarting the worker; that's the whole point

@@ -618,7 +618,14 @@ async fn download_and_verify(
         .await
         .map_err(|e| format!("preflight run could not be started: {e}"))??;
 
-    swap(path, dir, tmp)
+    let target = path.to_path_buf();
+    let install_dir = dir.to_path_buf();
+    let staged = tmp.to_path_buf();
+    // Two renames plus a directory `fsync`, all blocking — and the fsync
+    // is the one that can stall on an SD card. Off the runtime it goes.
+    tokio::task::spawn_blocking(move || swap(&target, &install_dir, &staged))
+        .await
+        .map_err(|e| format!("install step could not be started: {e}"))?
 }
 
 /// Prove the downloaded binary both runs on this system and accepts the
