@@ -396,13 +396,21 @@ function applyConfig(cfg) {
   formDirty = false;
 }
 
-// Boot path only — the WebSocket keeps the form current after this.
+// Boot path only — the WebSocket keeps the form current after this, and
+// its connect snapshot usually delivers the same config before this
+// fetch and its device scan (a few hundred ms of USB probing on the
+// daemon, longer when a driver is present but the dongle isn't) return.
+// By then the operator can already be typing, so the dirty check is
+// re-read after every await: a late boot response must not wipe an edit
+// that started while it was in flight.
 async function loadConfig() {
   const r = await fetch("/api/config");
   if (!r.ok) return;
   const cfg = await r.json();
-  await loadDevices(cfg.driver || "");
-  applyConfig(cfg);
+  // `undefined` keeps whatever is selected instead of forcing the saved
+  // driver over a device the operator just picked.
+  await loadDevices(formDirty ? undefined : cfg.driver || "");
+  if (!formDirty) applyConfig(cfg);
 }
 
 // A `config` frame means the running config changed: another browser on
