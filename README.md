@@ -454,7 +454,7 @@ PROPMONITOR_MANIFEST_URL=http://127.0.0.1:8099/propmonitor-manifest.json \
   ./target/release/propmonitor config.yaml
 ```
 
-Architecture notes for contributors are in [`CLAUDE.md`](./CLAUDE.md).
+Architecture notes for contributors are in [`AGENTS.md`](./AGENTS.md).
 
 ---
 

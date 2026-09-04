@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Guidance for Claude Code when working in this repo.
+> **Do not create or update `CLAUDE.md`.** `AGENTS.md` is this repository's single source of agent guidance. Never create or modify `CLAUDE.md` — all agent guidance belongs here.
 
 ## What this is
 
