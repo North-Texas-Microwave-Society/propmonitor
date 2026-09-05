@@ -413,9 +413,9 @@ step, so there is no npm anything.
 
 ### Releasing
 
-Development happens on a private Forgejo instance which push-mirrors to the
-public GitHub repository; GitHub Actions builds the binaries there. There
-are two channels, and both matter:
+Releases are built by GitHub Actions in
+[North-Texas-Microwave-Society/propmonitor](https://github.com/North-Texas-Microwave-Society/propmonitor).
+There are two channels, and both matter:
 
 **`main` → the rolling channel.** Every push to `main` runs
 `.github/workflows/latest.yml`: it builds x86_64, aarch64 and armv7 Linux

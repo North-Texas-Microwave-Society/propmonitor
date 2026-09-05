@@ -1,7 +1,7 @@
 #!/bin/bash
 # propmonitor — one-command installer
 #
-#   curl -sSL https://raw.githubusercontent.com/graham/propmonitor/main/install.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/North-Texas-Microwave-Society/propmonitor/main/install.sh | sudo bash
 #
 # Installs the latest propmonitor binary release + systemd service on a
 # clean Debian 13 (Trixie) / Debian 12 (Bookworm) / Ubuntu 24.04 LTS /
@@ -27,9 +27,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config — change these if you fork the repo
 #
-# Development happens on the private Forgejo instance; that repo push-mirrors
-# to the public GitHub one, whose Actions build and publish the release
-# binaries. So downloads always come from GitHub, never from Forgejo.
+# Everything the installer downloads comes from the GitHub repository below:
+# its Actions build and publish the release binaries.
 # ---------------------------------------------------------------------------
 REPO="North-Texas-Microwave-Society/propmonitor"
 GITHUB_API="https://api.github.com/repos/${REPO}"
