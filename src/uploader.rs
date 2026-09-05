@@ -227,7 +227,18 @@ pub async fn run(
                             backoff = Duration::from_secs(1);
                             continue;
                         }
-                        tokio::time::sleep(backoff).await;
+                        if backoff_and_drain(
+                            &cfg,
+                            &device_info,
+                            &status,
+                            &mut queue,
+                            &mut measurements_rx,
+                            backoff,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                         backoff = (backoff * 2).min(max_backoff);
                         continue;
                     }
@@ -238,47 +249,94 @@ pub async fn run(
         // Then wait for the next measurement event or a short tick.
         let recv = tokio::time::timeout(Duration::from_secs(5), measurements_rx.recv()).await;
         match recv {
-            Ok(Ok(WsEvent::Measurement {
-                measured_at,
-                noise_floor_dbfs,
-                signal_peak_dbfs,
-                signal_avg_dbfs,
-                snr_peak_db,
-                snr_avg_db,
-                signal_active_fraction,
-            })) => {
-                let c = cfg.read().await;
-                let Some(mw) = c.microwaveprop.as_ref().filter(|m| should_upload(m)) else {
-                    let mut s = status.write().await;
-                    s.enabled = false;
-                    continue;
-                };
-                {
-                    let mut s = status.write().await;
-                    s.enabled = true;
-                }
-                let gain_db = gain_from_device_info(device_info.read().await.as_ref(), c.gain);
-                let m = build_wire_measurement(
-                    &c,
-                    mw,
-                    gain_db,
-                    measured_at,
-                    noise_floor_dbfs,
-                    signal_peak_dbfs,
-                    signal_avg_dbfs,
-                    snr_peak_db,
-                    snr_avg_db,
-                    signal_active_fraction,
-                );
-                if queue.len() >= MAX_ENTRIES {
-                    queue.pop_front();
-                }
-                queue.push_back(m);
+            Ok(Ok(ev)) => {
+                enqueue_measurement(&cfg, &device_info, &status, &mut queue, ev).await;
             }
-            Ok(Ok(_)) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => break,
             Err(_timeout) => continue, // tick to retry queue
+        }
+    }
+}
+
+/// Build and enqueue one measurement onto the retry queue, stamping the
+/// uploader's enabled state from the live config. A no-op for any frame that
+/// is not a completed `Measurement` (waterfall/raw frames share the channel).
+async fn enqueue_measurement(
+    cfg: &Arc<RwLock<Config>>,
+    device_info: &Arc<RwLock<Option<WsEvent>>>,
+    status: &Arc<RwLock<UploaderStatus>>,
+    queue: &mut VecDeque<WireMeasurement>,
+    ev: WsEvent,
+) {
+    let WsEvent::Measurement {
+        measured_at,
+        noise_floor_dbfs,
+        signal_peak_dbfs,
+        signal_avg_dbfs,
+        snr_peak_db,
+        snr_avg_db,
+        signal_active_fraction,
+    } = ev
+    else {
+        return;
+    };
+    let c = cfg.read().await;
+    let Some(mw) = c.microwaveprop.as_ref().filter(|m| should_upload(m)) else {
+        let mut s = status.write().await;
+        s.enabled = false;
+        return;
+    };
+    {
+        let mut s = status.write().await;
+        s.enabled = true;
+    }
+    let gain_db = gain_from_device_info(device_info.read().await.as_ref(), c.gain);
+    let m = build_wire_measurement(
+        &c,
+        mw,
+        gain_db,
+        measured_at,
+        noise_floor_dbfs,
+        signal_peak_dbfs,
+        signal_avg_dbfs,
+        snr_peak_db,
+        snr_avg_db,
+        signal_active_fraction,
+    );
+    if queue.len() >= MAX_ENTRIES {
+        queue.pop_front();
+    }
+    queue.push_back(m);
+}
+
+/// Wait out a transient-failure `backoff`, but keep reading `measurements_rx`
+/// and enqueuing measurements the whole time.
+///
+/// The retry queue only earns its keep if an outage preserves the datapoints
+/// generated during it. `measurements_rx` is a shared broadcast that also
+/// carries high-rate waterfall/raw frames, so a plain `sleep` here would let
+/// its capacity overflow within seconds and drop the very measurements the
+/// outage produced. Returns `true` when the broadcast is closed (the task
+/// should end).
+async fn backoff_and_drain(
+    cfg: &Arc<RwLock<Config>>,
+    device_info: &Arc<RwLock<Option<WsEvent>>>,
+    status: &Arc<RwLock<UploaderStatus>>,
+    queue: &mut VecDeque<WireMeasurement>,
+    measurements_rx: &mut broadcast::Receiver<WsEvent>,
+    backoff: Duration,
+) -> bool {
+    let deadline = tokio::time::sleep(backoff);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return false,
+            recv = measurements_rx.recv() => match recv {
+                Ok(ev) => enqueue_measurement(cfg, device_info, status, queue, ev).await,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return true,
+            },
         }
     }
 }
@@ -727,6 +785,64 @@ mod tests {
 
         drop(meas_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    /// The transient-failure backoff must keep draining `measurements_rx`
+    /// while it waits. The channel shares space with high-rate waterfall and
+    /// raw-level frames; sleeping through the backoff would overflow it and
+    /// drop the measurements an outage produced — defeating the retry queue.
+    ///
+    /// A concurrent sender floods the channel beyond its capacity with
+    /// interleaved noise + measurement frames *while* the receiver is inside
+    /// `backoff_and_drain`; every measurement must still land in the queue.
+    #[tokio::test]
+    async fn backoff_and_drain_enqueues_measurements_arriving_during_the_wait() {
+        let cfg = Arc::new(RwLock::new(Config {
+            microwaveprop: Some(sample_mw()),
+            ..sample_cfg()
+        }));
+        let device_info = Arc::new(RwLock::new(None));
+        let status = Arc::new(RwLock::new(UploaderStatus::default()));
+        // Small on purpose: the noise frames would overflow it if the
+        // receiver were asleep instead of draining.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<WsEvent>(4);
+        let mut queue: VecDeque<WireMeasurement> = VecDeque::new();
+
+        let sender_tx = tx.clone();
+        let sender = tokio::spawn(async move {
+            for i in 0..8 {
+                let _ = sender_tx.send(WsEvent::RawLevel { dbfs: -50.0 });
+                let _ = sender_tx.send(WsEvent::Measurement {
+                    measured_at: format!("2026-05-13T15:30:{i:02}Z"),
+                    noise_floor_dbfs: -110.0,
+                    signal_peak_dbfs: -88.0,
+                    signal_avg_dbfs: -89.0,
+                    snr_peak_db: 22.0,
+                    snr_avg_db: 21.0,
+                    signal_active_fraction: 1.0,
+                });
+                // Let the draining receiver keep up, as it does in real use
+                // (production frames arrive at ~15 Hz, far below drain speed).
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let closed = backoff_and_drain(
+            &cfg,
+            &device_info,
+            &status,
+            &mut queue,
+            &mut rx,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        sender.await.unwrap();
+
+        assert!(!closed);
+        // Every measurement the sender published is enqueued; only the
+        // raw-level noise frames are discarded as expected.
+        assert_eq!(queue.len(), 8);
+        assert!(status.read().await.enabled);
     }
 
     #[test]

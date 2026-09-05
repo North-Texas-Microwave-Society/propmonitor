@@ -197,6 +197,17 @@ pub struct ServerHandle {
 /// in-flight request to finish). Instead we signal it and let a background
 /// task reap it once its connections drain.
 pub async fn restart_server(state: &Arc<AppState>, bind: &str) -> Result<(), Error> {
+    let (addr, listener) = bind_listener(bind).await?;
+    commit_server(state, addr, listener);
+    Ok(())
+}
+
+/// Bind `bind` eagerly, without touching the running server. Returns the
+/// parsed address plus the held listener, which is not yet serving — the
+/// caller decides when to commit it (see [`commit_server`]). Dropping the
+/// listener releases the address, so a caller that changes its mind leaves
+/// the running server untouched.
+async fn bind_listener(bind: &str) -> Result<(SocketAddr, tokio::net::TcpListener), Error> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| Error::msg(format!("invalid http.bind {:?}: {}", bind, e)))?;
@@ -207,7 +218,14 @@ pub async fn restart_server(state: &Arc<AppState>, bind: &str) -> Result<(), Err
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| Error::msg(format!("bind {}: {}", addr, e)))?;
+    Ok((addr, listener))
+}
 
+/// Swap the running HTTP server over to the already-bound `listener`. The
+/// old server is signalled to stop and reaped off-thread — never awaited
+/// here, because the caller may be running *inside* that server (see the
+/// `restart_server` doc comment on the deadlock).
+fn commit_server(state: &Arc<AppState>, addr: SocketAddr, listener: tokio::net::TcpListener) {
     if let Some(old) = take_server(state) {
         old.shutdown.notify_one();
         tokio::spawn(async move {
@@ -216,7 +234,6 @@ pub async fn restart_server(state: &Arc<AppState>, bind: &str) -> Result<(), Err
     }
 
     spawn_server(state, addr, listener);
-    Ok(())
 }
 
 fn take_server(state: &Arc<AppState>) -> Option<ServerHandle> {
@@ -448,9 +465,10 @@ impl std::error::Error for ApplyError {}
 
 /// Validate, persist and activate a config update. Shared by
 /// `PUT /api/config` and the microwaveprop sync task, so both surfaces get
-/// the same ordering guarantees: rebind before persist (a bad bind fails
-/// without touching the file on disk), persist before the in-memory swap,
-/// worker restart last.
+/// the same ordering guarantees: a new bind is validated eagerly (a bad bind
+/// fails without touching the file on disk) but committed only after the
+/// config is durably written, the write happens before the in-memory swap,
+/// and the worker restart comes last.
 ///
 /// `config_version` is the version to record under
 /// `microwaveprop.config_version`: `Some(v)` when the config came *from*
@@ -468,20 +486,31 @@ pub async fn apply_config(
         build_yaml_from_update(body, &current, config_version).map_err(ApplyError::Invalid)?;
     let new_cfg = Config::from_yaml_str(&yaml).map_err(ApplyError::Invalid)?;
 
-    // If the bind address changed, rebind the HTTP listener *before*
-    // persisting so a bad bind fails cleanly and leaves config on disk
-    // untouched. `restart_server` never awaits the old server from inside
-    // this request (see its doc comment).
-    if new_cfg.http.bind != current.http.bind {
-        restart_server(state, &new_cfg.http.bind)
-            .await
-            .map_err(ApplyError::Internal)?;
-    }
+    // If the bind address changed, bind the new listener eagerly so a bad
+    // bind fails cleanly and leaves config on disk untouched — but hold it,
+    // uncommitted, until the config is durably persisted. A failed write
+    // must not leave the process listening on an address its on-disk config
+    // no longer names (or vice versa).
+    let rebind = new_cfg.http.bind != current.http.bind;
+    let new_listener = if rebind {
+        Some(
+            bind_listener(&new_cfg.http.bind)
+                .await
+                .map_err(ApplyError::Internal)?,
+        )
+    } else {
+        None
+    };
 
     write_config_file(&state.config_path, &yaml)
         .await
         .map_err(ApplyError::Internal)?;
 
+    // Persistence succeeded — now it is safe to move the listener. (The old
+    // server is signalled to stop and reaped off-thread; see `commit_server`.)
+    if let Some((addr, listener)) = new_listener {
+        commit_server(state, addr, listener);
+    }
     {
         let mut active = state.config.write().await;
         *active = new_cfg.clone();
@@ -1954,6 +1983,25 @@ mod tests {
         let bytes = body_bytes(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["error"].is_string());
+    }
+
+    /// A bind change plus a failing write must not leave the process
+    /// listening on the new address while the on-disk (and in-memory) config
+    /// still names the old one. The eagerly-bound listener is dropped, so no
+    /// server is committed.
+    #[tokio::test]
+    async fn apply_config_leaves_the_listener_uncommitted_when_the_write_fails() {
+        let state = test_state(sample_cfg(), "/nonexistent-dir/propmonitor.yaml");
+        let mut body = sample_update();
+        body.http = Some(HttpUpdate {
+            bind: "127.0.0.1:0".to_string(),
+        });
+
+        let err = apply_config(&state, &body, None).await.unwrap_err();
+        assert!(matches!(err, ApplyError::Internal(_)));
+
+        // No server was swapped in — the old (here: none) is untouched.
+        assert!(state.http_server.lock().unwrap().is_none());
     }
 
     #[tokio::test]

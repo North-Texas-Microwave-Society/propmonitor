@@ -355,19 +355,42 @@ fn report_body(cfg: &Config) -> ReportBody {
 /// keeps one session from re-sending it on every loop turn.
 #[derive(Debug, Default)]
 struct ReportState {
+    /// An edit microwaveprop has not yet acked, and no report for it is
+    /// currently in flight.
     pending: bool,
+    /// A `config_report` is in flight and we are waiting on its
+    /// `config_accepted`.
     awaiting_ack: bool,
+    /// A newer edit arrived while `awaiting_ack`. The in-flight report
+    /// carries a superseded snapshot; the newer one must be re-sent after
+    /// the in-flight ack lands rather than sent as a second, overlapping
+    /// report (whose stale ack would otherwise clear `pending` and lose the
+    /// edit if the socket drops before the newer report's own ack).
+    dirty: bool,
 }
 
 impl ReportState {
     fn mark_edit(&mut self) {
-        self.pending = true;
-        self.awaiting_ack = false;
+        if self.awaiting_ack {
+            // A report is already in flight for a previous edit. Don't
+            // send a second, overlapping report — remember that this newer
+            // edit still owes a report once the in-flight ack returns.
+            self.dirty = true;
+        } else {
+            self.pending = true;
+        }
     }
 
     fn acked(&mut self) {
-        self.pending = false;
         self.awaiting_ack = false;
+        if self.dirty {
+            // The ack just received was for a superseded snapshot; the
+            // newer edit still needs reporting.
+            self.dirty = false;
+            self.pending = true;
+        } else {
+            self.pending = false;
+        }
     }
 }
 
@@ -469,6 +492,12 @@ async fn run_session(
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = ws.split();
     report.awaiting_ack = false;
+    // A session boundary abandons any in-flight report. If an edit arrived
+    // while one was in flight, that edit still owes a report here.
+    if report.dirty {
+        report.pending = true;
+        report.dirty = false;
+    }
 
     let (local_ip, local_port) = local_endpoint(state).await;
     let hello = {
@@ -1117,6 +1146,44 @@ mod tests {
     }
 
     #[test]
+    fn report_state_serializes_reports_and_preserves_newer_edits() {
+        let mut r = ReportState::default();
+
+        // An edit with no report in flight is pending and ready to send.
+        r.mark_edit();
+        assert!(r.pending);
+        assert!(!r.awaiting_ack);
+
+        // The loop sends the report.
+        r.awaiting_ack = true;
+
+        // A second edit arrives while that report is in flight. It must not
+        // clear `awaiting_ack` (which would allow an overlapping report),
+        // and must be remembered for after the in-flight ack.
+        r.mark_edit();
+        assert!(r.awaiting_ack, "in-flight report must not be overlapped");
+        assert!(r.dirty);
+
+        // The first report's ack arrives. The superseded edit is still owed
+        // a report, so `pending` must survive instead of being cleared by a
+        // stale ack.
+        r.acked();
+        assert!(!r.awaiting_ack);
+        assert!(r.pending);
+        assert!(!r.dirty);
+
+        // The loop sends the newer snapshot.
+        r.awaiting_ack = true;
+        assert!(r.pending && r.awaiting_ack);
+
+        // Its own ack settles everything.
+        r.acked();
+        assert!(!r.pending);
+        assert!(!r.awaiting_ack);
+        assert!(!r.dirty);
+    }
+
+    #[test]
     fn port_from_bind_handles_the_shapes_config_allows() {
         assert_eq!(port_from_bind("0.0.0.0:5760"), Some(5760));
         assert_eq!(port_from_bind("127.0.0.1:80"), Some(80));
@@ -1404,6 +1471,7 @@ mod tests {
         let mut report = ReportState {
             pending: true,
             awaiting_ack: false,
+            dirty: false,
         };
 
         poll_cycle(
